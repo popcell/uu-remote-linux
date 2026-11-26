@@ -847,18 +847,42 @@ mod budget_tests {
             assert!(!engine.0.is_null(), "vaapi_create failed for {fmt}");
             let mut stream = Vec::new();
             let mut pixels = vec![0u8; (w * h * 4) as usize];
-            let total_frames = 50u32;
+            let mut expected_rgb = Vec::new();
+            let total_frames = 30u32;
             for idx in 0..total_frames {
-                // Moving synthetic color bars across 2.5 GOPs + forced mid-GOP PLI IDR at frame 11.
+                // High-contrast moving window over a textured grid (exposes inter-prediction MV/reference bugs).
+                let bx = (100 + idx * 24) % (w - 320);
+                let by = (80 + idx * 14) % (h - 220);
                 for y in 0..h {
                     for x in 0..w {
                         let off = ((y * w + x) * 4) as usize;
-                        pixels[off] = ((x + idx * 7) & 0xff) as u8;
-                        pixels[off + 1] = ((y + idx * 5) & 0xff) as u8;
-                        pixels[off + 2] = (((x ^ y) + idx * 3) & 0xff) as u8;
+                        let in_box = x >= bx && x < bx + 300 && y >= by && y < by + 200;
+                        let (b, g, r) = if in_box {
+                            if (x - bx) < 8 || (y - by) < 28 { (220u8, 120u8, 40u8) }
+                            else if ((x - bx) / 20 + (y - by) / 20) % 2 == 0 { (245, 245, 245) }
+                            else { (40, 40, 40) }
+                        } else if (x / 64 + y / 64) % 2 == 0 {
+                            (32, 36, 42)
+                        } else {
+                            (58, 64, 72)
+                        };
+                        pixels[off] = b;
+                        pixels[off + 1] = g;
+                        pixels[off + 2] = r;
                         pixels[off + 3] = 255;
                     }
                 }
+                // Downsample 16x16 grid of reference pixels (BGR -> RGB) to check decoded fidelity per frame.
+                let mut ref_sample = Vec::with_capacity((w / 16 * h / 16 * 3) as usize);
+                for y in (0..h).step_by(16) {
+                    for x in (0..w).step_by(16) {
+                        let off = ((y * w + x) * 4) as usize;
+                        ref_sample.push(pixels[off + 2]);
+                        ref_sample.push(pixels[off + 1]);
+                        ref_sample.push(pixels[off]);
+                    }
+                }
+                expected_rgb.push(ref_sample);
                 assert_eq!(unsafe { vaapi_upload_host_buffer(engine.0, pixels.as_ptr(), w * 4) }, 0);
                 let mut out_ptr = std::ptr::null();
                 let mut out_len = 0u32;
@@ -870,7 +894,7 @@ mod budget_tests {
             }
             let mut decoder = Command::new("ffmpeg").args([
                 "-hide_banner", "-loglevel", "error", "-f", fmt, "-i", "pipe:0",
-                "-fps_mode", "passthrough", "-vf", "scale=2:2", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
+                "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
             ]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
             let mut stdin = decoder.stdin.take().unwrap();
             let writer = std::thread::spawn(move || stdin.write_all(&stream));
@@ -878,8 +902,28 @@ mod budget_tests {
             writer.join().unwrap().unwrap();
             assert!(out.status.success() && out.stderr.is_empty(),
                 "{fmt} decode errors: {}", String::from_utf8_lossy(&out.stderr));
-            assert_eq!(out.stdout.len(), (total_frames as usize) * 2 * 2 * 3,
+            let frame_bytes = (w * h * 3) as usize;
+            assert_eq!(out.stdout.len(), (total_frames as usize) * frame_bytes,
                 "{fmt} decoded frame count mismatch");
+            let mut worst_mae = 0.0f64;
+            for (idx, ref_sample) in expected_rgb.iter().enumerate() {
+                let dec = &out.stdout[idx * frame_bytes..(idx + 1) * frame_bytes];
+                let mut sum_err = 0u64;
+                let mut s = 0usize;
+                for y in (0..h).step_by(16) {
+                    for x in (0..w).step_by(16) {
+                        let off = ((y * w + x) * 3) as usize;
+                        sum_err += u64::from(dec[off].abs_diff(ref_sample[s]));
+                        sum_err += u64::from(dec[off + 1].abs_diff(ref_sample[s + 1]));
+                        sum_err += u64::from(dec[off + 2].abs_diff(ref_sample[s + 2]));
+                        s += 3;
+                    }
+                }
+                let mae = sum_err as f64 / ref_sample.len() as f64;
+                worst_mae = worst_mae.max(mae);
+                assert!(mae < 12.0, "{fmt} frame {idx} smeared/corrupted: MAE={mae:.2}");
+            }
+            println!("{fmt} moving-window fidelity passed: frames={total_frames} worst_mae={worst_mae:.2}");
         }
     }
 

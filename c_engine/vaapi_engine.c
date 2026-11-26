@@ -792,6 +792,7 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     }
     slice_p.max_num_merge_cand = 5;
     slice_p.slice_fields.bits.last_slice_of_pic_flag = 1;
+    slice_p.slice_fields.bits.slice_temporal_mvp_enabled_flag = tmvp && !is_idr;
     slice_p.slice_fields.bits.slice_sao_luma_flag = 1;
     slice_p.slice_fields.bits.slice_sao_chroma_flag = 1;
     slice_p.slice_fields.bits.collocated_from_l0_flag = !is_idr;
