@@ -1,5 +1,6 @@
 #include "vaapi_engine.h"
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -102,6 +103,9 @@ struct VaapiEngine {
     int idr_pending;
     // frame_num / POC bookkeeping since the last IDR; H264 state the driver does not derive itself
     uint32_t frame_num;
+    // Rate control is resent when it changed (live retune) or with an IDR; min_qp is the preset's CQ.
+    int rc_dirty;
+    uint32_t min_qp;
     uint32_t rc_mode;
     VAProfile enc_profile;
     int low_power;
@@ -165,6 +169,7 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
     engine->max_bps = config->max_bps > engine->target_bps ? config->max_bps : engine->target_bps;
     engine->buffer_bits = config->buffer_bits > 0 ? config->buffer_bits : engine->max_bps;
     engine->is_hevc = config->is_hevc;
+    engine->min_qp = 16;
     engine->dma_fd = -1;
     // calloc leaves surface/context IDs at 0, which is a valid VA ID; mark them unset.
     engine->in_rgb_surf = VA_INVALID_ID;
@@ -494,6 +499,9 @@ static int vaapi_add_packed(VaapiEngine* engine, VAEncPackedHeaderType type, con
     return 0;
 }
 
+/* A missing rate-control buffer must fail the picture: on AMD a CBR config that never gets its
+ * parameters submits garbage and wedges the VCN ring (see the note above), and on Intel the frame
+ * silently keeps the previous rate. */
 static VABufferID vaapi_create_misc_buffer(VaapiEngine* engine, VAEncMiscParameterType type, const void* param, uint32_t param_size) {
     uint8_t buf[sizeof(VAEncMiscParameterBuffer) + 64];
     VAEncMiscParameterBuffer* misc = (VAEncMiscParameterBuffer*)buf;
@@ -513,7 +521,7 @@ typedef struct {
     int misc_n, packed_n;
 } EncBuffers;
 
-static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_recon, VASurfaceID prev_recon, EncBuffers* b) {
+static int vaapi_h264_params(VaapiEngine* engine, int is_idr, int send_seq, VASurfaceID curr_recon, VASurfaceID prev_recon, EncBuffers* b) {
     uint32_t mb_w = (engine->width + 15) / 16;
     uint32_t mb_h = (engine->height + 15) / 16;
     uint32_t frame_num = is_idr ? 0 : engine->frame_num;
@@ -521,8 +529,11 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     int baseline = (engine->enc_profile == VAProfileH264ConstrainedBaseline);
     int high = (engine->enc_profile == VAProfileH264High);
     int cabac = !baseline;
-    if (is_idr) {
-        VAEncSequenceParameterBufferH264 seq_p;
+    // A retune resubmits the sequence buffer without its parameter sets: iHD derives its BRC target
+    // from seq.bits_per_second and keeps it per sequence, so the misc rate-control buffer alone left
+    // the bitrate where it was (measured: 2 -> 8 Mbit/s changed the encoded size by 4 %).
+    VAEncSequenceParameterBufferH264 seq_p;
+    if (is_idr || send_seq) {
         memset(&seq_p, 0, sizeof(seq_p));
         seq_p.seq_parameter_set_id = 0;
         seq_p.level_idc = 51;
@@ -542,7 +553,8 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         // An IDR without its SPS is undecodable: fail rather than submit pic + slice alone
         if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncSequenceParameterBufferType, sizeof(seq_p), 1, &seq_p, &b->seq) != VA_STATUS_SUCCESS)
             return -1;
-
+    }
+    if (is_idr) {
         // SPS: profile matches negotiated VAProfile, level 5.1, frame_num and POC lsb 4 bits, one reference
         BitWriter sps = {0};
         bw_nal(&sps, 3, 7);
@@ -660,7 +672,7 @@ static void bw_hevc_ptl(BitWriter* w, uint32_t level) {
 // On radeonsi EncSlice, FFmpeg sends VA max_transform_hierarchy_depth 0 / diff_cu_qp_delta_depth 3 while
 // SPS/PPS say 4 / 0. On Intel iHD EncSliceLP, VDENC honors TU depth 2/2, diff_cu_qp_delta_depth 3,
 // temporal MVP, and encodes non-IDR pictures as GPB low-delay B-slices (slice_type=0, L0=L1=prev_recon).
-static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_recon, VASurfaceID prev_recon, EncBuffers* b) {
+static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, int send_seq, VASurfaceID curr_recon, VASurfaceID prev_recon, EncBuffers* b) {
     // pic size must be a multiple of the 8x8 min CB; the conformance window (in chroma units) crops the rest
     uint32_t w = (engine->width + 7) & ~7u, h = (engine->height + 7) & ~7u;
     uint32_t crop_right = (w - engine->width) / 2, crop_bottom = (h - engine->height) / 2;
@@ -673,8 +685,8 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     // Level from luma picture size and sample rate (Table A.8): 4.1, 5.0, 5.1, 5.2
     uint64_t size = (uint64_t)w * h, rate = size * engine->fps;
     uint32_t level = rate > 534773760 ? 156 : rate > 267386880 ? 153 : (size > 2228224 || rate > 133693440) ? 150 : 123;
-    if (is_idr) {
-        VAEncSequenceParameterBufferHEVC seq_p;
+    VAEncSequenceParameterBufferHEVC seq_p;
+    if (is_idr || send_seq) {
         memset(&seq_p, 0, sizeof(seq_p));
         seq_p.general_profile_idc = 1;
         seq_p.general_level_idc = level;
@@ -696,7 +708,8 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         }
         if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncSequenceParameterBufferType, sizeof(seq_p), 1, &seq_p, &b->seq) != VA_STATUS_SUCCESS)
             return -1;
-
+    }
+    if (is_idr) {
         BitWriter vps = {0};
         bw_hevc_nal(&vps, 32);
         bw_put(&vps, 0, 4); bw_put(&vps, 1, 1); bw_put(&vps, 1, 1);      // vps id, base layer internal / available
@@ -849,10 +862,13 @@ int vaapi_encode_frame(
     st = RT.vaEndPicture(engine->va_dpy, engine->vpp_ctx);
     if (st != VA_STATUS_SUCCESS) return -10;
 
-    // 2. Rate control (every IDR) and the codec's sequence / picture / slice parameters + packed headers
+    // 2. Rate control and the codec's sequence / picture / slice parameters + packed headers
     EncBuffers b = { .seq = VA_INVALID_ID, .pic = VA_INVALID_ID, .slice = VA_INVALID_ID };
     int ret = -11;
-    if (is_idr) {
+    // Rate control, the HRD size, the frame rate and the sequence's rate information are resubmitted
+    // whenever they changed. The parameter sets themselves (SPS/PPS/VPS) still only ride an IDR.
+    int send_rc = is_idr || engine->rc_dirty;
+    if (send_rc) {
         VAEncMiscParameterRateControl rc;
         memset(&rc, 0, sizeof(rc));
         // VBR: bits_per_second is the ceiling (maxrate) and target_percentage the average (#33)
@@ -860,7 +876,7 @@ int vaapi_encode_frame(
         rc.target_percentage = engine->rc_mode == VA_RC_VBR ? (uint32_t)(engine->target_bps * 100 / engine->max_bps) : 100;
         rc.window_size = 1000;
         rc.initial_qp = 28;
-        rc.min_qp = 16;
+        rc.min_qp = engine->min_qp > 51 ? 51 : engine->min_qp;
         // The driver's VBR raises QP only up to max_qp; 44 blocked the capped presets from reaching
         // the QP 51 hardware floor on hard content (2560x1600 testsrc2: 4.16 -> 2.60 Mbps, #33)
         rc.max_qp = 51;
@@ -876,8 +892,11 @@ int vaapi_encode_frame(
         // numerator in the low 16 bits, denominator in the high 16 bits
         VAEncMiscParameterFrameRate fr = { .framerate = (1u << 16) | engine->fps };
         b.misc[b.misc_n++] = vaapi_create_misc_buffer(engine, VAEncMiscParameterTypeFrameRate, &fr, sizeof(fr));
+        for (int i = 0; i < b.misc_n; i++) {
+            if (b.misc[i] == VA_INVALID_ID) goto done;
+        }
     }
-    if ((engine->is_hevc ? vaapi_hevc_params : vaapi_h264_params)(engine, is_idr, curr_recon, prev_recon, &b) != 0) goto done;
+    if ((engine->is_hevc ? vaapi_hevc_params : vaapi_h264_params)(engine, is_idr, send_rc, curr_recon, prev_recon, &b) != 0) goto done;
 
     // 3. Render and Encode on AMD VCN hardware
     VABufferID render_b[12];
@@ -899,10 +918,21 @@ int vaapi_encode_frame(
     st = RT.vaEndPicture(engine->va_dpy, engine->enc_ctx);
     if (st != VA_STATUS_SUCCESS) goto done;
     if (RT.vaSyncBuffer) {
-        st = RT.vaSyncBuffer(engine->va_dpy, engine->coded_buf, VA_TIMEOUT_INFINITE);
+        // Bounded: an infinite wait on a wedged GPU freezes the stream (and, before the lease was
+        // released before encoding, input with it).
+        st = RT.vaSyncBuffer(engine->va_dpy, engine->coded_buf, 500ull * 1000 * 1000);
         if (st == VA_STATUS_ERROR_UNIMPLEMENTED) st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
     } else {
         st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+    }
+    if (st == VA_STATUS_ERROR_TIMEDOUT) {
+        // A timed-out frame is still owned by the GPU: the coded buffer and the reconstruction
+        // surface must not be reused, and the caller must not release its DMA-BUF lease as if the
+        // copy had finished. Fail the picture hard so the pipeline is torn down and reopened.
+        static atomic_uint timeouts;
+        if (atomic_fetch_add(&timeouts, 1) < 12) fprintf(stderr, "[vaapi] encode completion timed out; dropping the pipeline\n");
+        ret = -12;
+        goto done;
     }
     if (st != VA_STATUS_SUCCESS) goto done;
 
@@ -930,6 +960,7 @@ int vaapi_encode_frame(
     engine->frame_num = is_idr ? 1 : ((engine->frame_num + 1) & 15);
     engine->since_idr = is_idr ? 1 : engine->since_idr + 1;
     engine->frame_count++;
+    engine->rc_dirty = 0;
     ret = 0;
 
 done:
@@ -943,6 +974,22 @@ done:
     if (b.slice != VA_INVALID_ID) RT.vaDestroyBuffer(engine->va_dpy, b.slice);
     for (int i = 0; i < b.packed_n; i++) RT.vaDestroyBuffer(engine->va_dpy, b.packed[i]);
     return ret;
+}
+
+/* A rate change takes effect with the next IDR, not on a P frame: iHD's VDENC derives its BRC
+ * tables per sequence and ignores a resubmitted rate-control/sequence buffer on a low-delay P frame
+ * (measured on Gen12 LP HEVC: 2 -> 8 Mbit/s on a running engine moved the output by 4 %, while the
+ * same rate applied with an IDR moved it 2.9x, exactly like a fresh engine). The IDR is cheap here:
+ * the context, surfaces and imported DMA-BUF stay, unlike the pipeline restart this replaces, which
+ * tore down the whole engine and renegotiated capture for the same keyframe. */
+void vaapi_set_rate(VaapiEngine* engine, int64_t target_bps, int64_t max_bps, int64_t buffer_bits, uint32_t cq) {
+    if (!engine) return;
+    if (target_bps > 0) engine->target_bps = target_bps;
+    if (max_bps > 0) engine->max_bps = max_bps > engine->target_bps ? max_bps : engine->target_bps;
+    if (buffer_bits > 0) engine->buffer_bits = buffer_bits;
+    if (cq) engine->min_qp = cq;
+    engine->rc_dirty = 1;
+    engine->idr_pending = 1;
 }
 
 void vaapi_destroy(VaapiEngine* engine) {

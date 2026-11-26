@@ -42,6 +42,12 @@ int vaapi_encode_frame(
     uint32_t* out_len
 );
 
+/* Retune rate control: VBR ceiling, target, HRD buffer size and the QP floor (the viewer's quality
+ * preset, what FFmpeg calls -qmin on this encoder). The context, surfaces and imported buffer stay
+ * and the change lands on the next IDR, so a send-side bitrate step costs one keyframe instead of the
+ * pipeline teardown it replaces. */
+void vaapi_set_rate(VaapiEngine* engine, int64_t target_bps, int64_t max_bps, int64_t buffer_bits, uint32_t cq);
+
 void vaapi_destroy(VaapiEngine* engine);
 
 #ifdef __cplusplus

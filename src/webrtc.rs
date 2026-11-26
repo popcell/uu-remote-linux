@@ -670,13 +670,15 @@ impl WebRtcSession {
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
             let mut governor = crate::video_governor::Governor::with_subprocess_climb(subprocess_climb);
-            let mut pending_apply_rev: Option<u64> = None;
+            let mut pending_apply: Option<PendingAu> = None;
+            let mut lost_total: Option<u32> = None;
+            let mut clock = NtpClock::new();
             let fps_adapt = crate::video_governor::FpsAdapt {
                 enabled: std::env::var("UU_VIDEO_FPS_ADAPT").map(|v| v.trim() == "1").unwrap_or(false),
             };
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
-                    feedback_counts.observe(packet.as_any());
+                    feedback_counts.observe(packet.as_any(), &governor_track);
                     if packet.as_any().is::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
                         || packet.as_any().is::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>() {
                         // Dedupe only while an IDR is pending; the encoder clears the flag when it emits one,
@@ -689,35 +691,46 @@ impl WebRtcSession {
                         reports += 1;
                         let log_now = reports == 1 || reports % 10 == 0;
                         for r in video_report_blocks(report, video_ssrc) {
-                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                            let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
-                            let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
-                            let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                            let ntp=clock.now();
+                            let elapsed=ntp.map(|ntp| ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay));
+                            let usable = r.last_sender_report!=0 && clock.accept(r.last_sender_report);
+                            let rtt=elapsed.filter(|e| usable&&*e<65536*30).map(|e|f64::from(e)*1000./65536.);
+                            let (loss, lost_packets) = loss_window(r.fraction_lost, r.total_lost, &mut lost_total);
                             if log_now {
-                                log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,rtt);
+                                log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} window_lost={:?} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,lost_packets,rtt);
                             }
                             // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
                             // or a swollen round trip is the only thing that lowers it.
                             let (ceiling,fps,nominal_fps)={let s=governor_settings.borrow();(s.ceiling_kbps(),s.effective_fps(),s.fps)};
-                            let loss=f32::from(r.fraction_lost)*100./256.;
                             let now_inst = std::time::Instant::now();
-                            if let Some(rev) = pending_apply_rev {
-                                if governor_track.revision() > rev {
+                            // The climb resumes on the first AU of the *new* encoder configuration.
+                            // The frame counter alone is also advanced by frames the replaced
+                            // encoder had already queued, which unfroze the gate before the restart
+                            // had produced anything; a pipeline that never comes up must not hold it.
+                            if let Some(pending) = pending_apply.as_ref() {
+                                if governor_track.generation() > pending.generation
+                                    || governor_track.rate_epoch() > pending.rate_epoch {
                                     governor.note_first_au(now_inst);
-                                    pending_apply_rev = None;
+                                    pending_apply = None;
+                                } else if now_inst.duration_since(pending.at) >= AU_GATE_TIMEOUT {
+                                    log::warn!("Video encoder restart has not produced a frame in {:?}; resuming the climb", AU_GATE_TIMEOUT);
+                                    governor.note_first_au(now_inst);
+                                    pending_apply = None;
                                 }
                             }
-                            let decision=governor.observe(loss,rtt,ceiling,fps,nominal_fps,&fps_adapt,now_inst);
+                            let receipt = crate::video_governor::Report { loss_percent: loss, lost_packets, rtt_ms: rtt };
+                            let decision=governor.observe_report(receipt,ceiling,fps,nominal_fps,&fps_adapt,now_inst);
                             if decision.cap.is_some()||decision.fps.is_some() {
                                 if let Some(cap)=decision.cap {
-                                    log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
+                                    log::info!("Video bitrate cap {}k: cause={} loss={:.1}% window_lost={:?} nack={} rtcp_rtt_ms={:?}",cap,cause_name(decision.cause),loss,lost_packets,feedback_counts.nack_packets,rtt);
                                 }
                                 match decision.fps {
-                                    Some(Some(step))=>log::info!("Video frame rate step {}fps: loss={:.1}% nack={} rtcp_rtt_ms={:?}",step,loss,feedback_counts.nack_packets,rtt),
+                                    Some(Some(step))=>log::info!("Video frame rate step {}fps: cause={} loss={:.1}% nack={} rtcp_rtt_ms={:?}",step,cause_name(decision.cause),loss,feedback_counts.nack_packets,rtt),
                                     Some(None)=>log::info!("Video frame rate released back to the viewer's setting"),
                                     None=>{},
                                 }
-                                let rev_before = governor_track.revision();
+                                let generation_before = governor_track.generation();
+                                let rate_epoch_before = governor_track.rate_epoch();
                                 let mut effective_changed = false;
                                 // Restarts the encoder at the new values through the settings watch;
                                 // one write so a bitrate+frame step reopens the pipeline exactly once.
@@ -733,13 +746,17 @@ impl WebRtcSession {
                                     true
                                 });
                                 if effective_changed {
-                                    pending_apply_rev = Some(rev_before);
+                                    pending_apply = Some(PendingAu { generation: generation_before, rate_epoch: rate_epoch_before, at: now_inst });
                                     governor.defer_climb_until_au();
                                 }
                             }
                         }
                         if log_now {
-                            log::info!("Video feedback totals: nack_packets={} pli={} fir={}",feedback_counts.nack_packets,feedback_counts.pli,feedback_counts.fir);
+                            let framing = governor_track.framing();
+                            let nack = feedback_counts.take_nack_attribution();
+                            log::info!("Video feedback totals: nack_packets={} pli={} fir={} nack_keyframe={} nack_other={} nack_stale={} aus={} keyframe_aus={} packets={} keyframe_packets={}",
+                                feedback_counts.nack_packets,feedback_counts.pli,feedback_counts.fir,
+                                nack.keyframe,nack.other,nack.stale,framing.aus,framing.keyframe_aus,framing.packets,framing.keyframe_packets);
                         }
                     }
                 }
@@ -2359,15 +2376,135 @@ fn ice_interface_allowed(name: &str) -> bool {
 
 /// Viewer feedback seen on the video sender: retransmission and keyframe requests.
 #[derive(Default)]
-pub(crate) struct FeedbackCounts { pub nack_packets: u64, pub pli: u64, pub fir: u64 }
+pub(crate) struct FeedbackCounts {
+    pub nack_packets: u64, pub pli: u64, pub fir: u64,
+    /// Requests attributed as they arrive, while the frame they refer to is still in the track's ring.
+    attribution: NackAttribution,
+}
+/// Retransmission requests attributed to the kind of frame that lost the packet.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NackAttribution { pub keyframe: u64, pub other: u64, pub stale: u64 }
 impl FeedbackCounts {
-    pub(crate) fn observe(&mut self, packet: &dyn std::any::Any) {
+    pub(crate) fn observe(&mut self, packet: &dyn std::any::Any, track: &crate::video_track::VideoTrack) {
         use webrtc::rtcp::{payload_feedbacks::{full_intra_request::FullIntraRequest, picture_loss_indication::PictureLossIndication}, transport_feedbacks::transport_layer_nack::TransportLayerNack};
         if let Some(nack) = packet.downcast_ref::<TransportLayerNack>() {
             self.nack_packets += nack.nacks.iter().map(|pair| 1 + u64::from(pair.lost_packets.count_ones())).sum::<u64>();
+            // Attribute each request to the frame that lost it: a keyframe's packet burst is the one
+            // the path may not fit, and its loss is what a periodic IDR costs the viewer.
+            use crate::video_track::NackClass;
+            for pair in &nack.nacks {
+                // The pair names its own packet plus the sixteen its bitmap covers.
+                for bit in 0..=16u16 {
+                    if bit == 0 || pair.lost_packets & (1 << (bit - 1)) != 0 {
+                        match track.classify_nack(pair.packet_id.wrapping_add(bit)) {
+                            NackClass::Keyframe => self.attribution.keyframe += 1,
+                            NackClass::Other => self.attribution.other += 1,
+                            NackClass::Stale => self.attribution.stale += 1,
+                        }
+                    }
+                }
+            }
         } else if packet.is::<PictureLossIndication>() { self.pli += 1; }
         else if packet.is::<FullIntraRequest>() { self.fir += 1; }
     }
+    /// The requests attributed since the last call; starts a new window.
+    pub(crate) fn take_nack_attribution(&mut self) -> NackAttribution { std::mem::take(&mut self.attribution) }
+}
+
+/// How many packets the report's own window really lost, and its fraction in percent.
+/// `fraction_lost` is quantized by the window: 250 ms at 15-20 fps holds 3-12 RTP packets, so one
+/// reordered or NACK-recovered packet reads as 33.2 % and two in twelve read as 16.4 % - measured
+/// on a 17-20 ms direct link whose every report said `lost=0`, and enough to halve the cap 60 times
+/// in 29 minutes. The growth of RFC 3550's cumulative count is what tells a burst from that noise,
+/// so the governor gets both and believes a fraction only with a count behind it (see
+/// `video_governor::Report`). An unknown count is 0, never "trust the fraction".
+fn loss_window(fraction_lost: u8, total_lost: u32, previous: &mut Option<u32>) -> (f32, u32) {
+    let percent = f32::from(fraction_lost) * 100.0 / 256.0;
+    // RFC 3550 packs a *signed* 24-bit count; webrtc-rs reads it as u32, so the upper half is a
+    // negative (duplicate-heavy) count and says nothing about loss.
+    let Some(total) = (total_lost < 1 << 23).then_some(total_lost) else {
+        // A negative count (more duplicates than losses) breaks the baseline: keeping the old one
+        // would make the next window's delta span two intervals.
+        *previous = None;
+        return (percent, 0);
+    };
+    let counted = previous.map_or(0, |previous| total.saturating_sub(previous));
+    *previous = Some(total);
+    (percent, counted)
+}
+
+fn cause_name(cause: Option<crate::video_governor::Cause>) -> &'static str {
+    match cause {
+        Some(crate::video_governor::Cause::Loss) => "loss",
+        Some(crate::video_governor::Cause::RoundTrip) => "rtt",
+        None => "none",
+    }
+}
+
+/// A settings change, waiting for an AU that carries it: the first one from a restarted pipeline, or
+/// any after an in-place rate retune (which keeps the pipeline and its generation).
+struct PendingAu { generation: u64, rate_epoch: u64, at: std::time::Instant }
+/// A pipeline that never produces a frame must not hold the climb down forever.
+const AU_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A wall-clock step (NTP, suspend/resume) is indistinguishable from queueing inside one report:
+/// one session measured 563 ms with `lost=0` on an 18 ms link. Beyond this much disagreement with
+/// the monotonic extrapolation the wall clock is treated as stepped.
+const WALL_STEP_MS: i64 = 200;
+/// How long after a clock step a report echoing a pre-step sender report may be rejected. Sender
+/// reports go out about once a second, so this is generous; without the bound the 16.16 half-range
+/// would turn the floor into a 9-hour rejection window.
+const STEP_GUARD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// RTCP round-trip time from our sender report's NTP timestamp (`lsr`, which webrtc-rs stamps from
+/// the wall clock) and the receiver's `dlsr`, computed on a monotonic base so an NTP step does not
+/// read as seconds of queueing.
+struct NtpClock {
+    base_ms: i64,
+    base: std::time::Instant,
+    /// After a step: an `lsr` older than this was stamped by the previous clock and would report the
+    /// step itself as round-trip time. 16.16 seconds, compared as a wrapped signed distance, and
+    /// dropped after `until` so a stale sample cannot reject valid ones once the range half fills up.
+    not_before: Option<(u32, std::time::Instant)>,
+}
+
+impl NtpClock {
+    fn new() -> Self { Self { base_ms: wall_ms(), base: std::time::Instant::now(), not_before: None } }
+    /// 16.16 fixed point NTP timestamp; only the low 32 bits survive the wrapping RTT math.
+    fn now(&mut self) -> Option<u32> {
+        let now = std::time::Instant::now();
+        let wall = wall_ms();
+        let forecast = self.base_ms + now.duration_since(self.base).as_millis() as i64;
+        // Re-anchor only while the wall clock moves smoothly; a step keeps the extrapolation.
+        let stepped = (wall - forecast).abs() > WALL_STEP_MS;
+        self.base_ms = wall;
+        self.base = now;
+        if stepped { self.not_before = Some((ntp_timestamp(wall), now + STEP_GUARD)); }
+        Some(ntp_timestamp(self.base_ms + now.duration_since(self.base).as_millis() as i64))
+    }
+    /// Whether a receiver report's echoed `lsr` can measure this clock: a report from before the last
+    /// step cannot, and nothing is rejected once the guard window passed.
+    fn accept(&mut self, lsr: u32) -> bool {
+        let Some((floor, until)) = self.not_before else { return true };
+        if std::time::Instant::now() >= until {
+            self.not_before = None;
+            return true;
+        }
+        if (lsr.wrapping_sub(floor) as i32) >= 0 {
+            self.not_before = None;
+            return true;
+        }
+        false
+    }
+}
+
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn ntp_timestamp(ms: i64) -> u32 {
+    let secs = ms.div_euclid(1000) as u64 + 2_208_988_800;
+    let fraction = (ms.rem_euclid(1000) as u64 * 65536 / 1000) as u32;
+    ((secs & 0xffff) as u32) << 16 | fraction
 }
 
 /// A compound RTCP packet is delivered to every SSRC's stream (webrtc-srtp), so a video sender
@@ -2388,11 +2525,68 @@ mod network_tests {
     #[test]
     fn feedback_counts_nacked_packets_and_keyframe_requests() {
         use webrtc::rtcp::{payload_feedbacks::picture_loss_indication::PictureLossIndication, transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack}};
+        let track = crate::video_track::VideoTrack::new();
         let mut counts = FeedbackCounts::default();
-        counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 10, lost_packets: 0b101 }], ..Default::default() });
-        counts.observe(&PictureLossIndication::default());
+        counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 10, lost_packets: 0b101 }], ..Default::default() }, &track);
+        counts.observe(&PictureLossIndication::default(), &track);
         assert_eq!((counts.nack_packets, counts.pli, counts.fir), (3, 1, 0));
+        // 10, 11 and 13: the pair's own id plus the bits of its bitmap.
+        assert_eq!(counts.take_nack_attribution(), NackAttribution { keyframe: 0, other: 0, stale: 3 });
+        assert_eq!(counts.take_nack_attribution(), NackAttribution::default(), "the window restarts");
+        // The last bit of the bitmap is a request for the seventeenth packet of the pair.
+        counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 20, lost_packets: 0x8000 }], ..Default::default() }, &track);
+        assert_eq!(counts.nack_packets, 5);
+        assert_eq!(counts.take_nack_attribution().stale, 2);
     }
+    #[test]
+    fn a_quantized_loss_fraction_is_only_believed_when_its_window_lost_packets() {
+        // The measured false trigger: 33.2 % and 24.6 % are one packet in a three or four packet
+        // window, and 8.2 % is one in twelve. The report's cumulative count is what tells them
+        // apart from a real burst.
+        let mut previous = None;
+        assert_eq!(loss_window(85, 1, &mut previous).1, 0, "the first report has no window to compare");
+        assert_eq!(loss_window(85, 2, &mut previous), (33.203125, 1));
+        assert_eq!(loss_window(63, 3, &mut previous), (24.609375, 1));
+        assert_eq!(loss_window(21, 7, &mut previous), (8.203125, 4));
+        // A path that really broke: dozens of packets per window.
+        assert_eq!(loss_window(65, 45, &mut previous).1, 38);
+        // A receiver that resets its counters must not read as a huge window of loss.
+        assert_eq!(loss_window(0, 0, &mut previous).1, 0);
+        // RFC 3550 packs a signed 24-bit count; the upper half is negative (duplicates), not loss.
+        assert_eq!(loss_window(85, 0xFF_FFFF, &mut previous).1, 0);
+    }
+
+    #[test]
+    fn a_wall_clock_step_does_not_read_as_round_trip_queueing() {
+        let mut clock = NtpClock::new();
+        assert!(clock.now().is_some(), "a smooth clock reports");
+        assert!(clock.now().is_some(), "reports keep coming while the wall clock is steady");
+        assert!(clock.accept(ntp_timestamp(wall_ms() - 1_000)), "a fresh sender report is usable");
+        // A negative cumulative count clears the baseline instead of spanning two windows.
+        let mut previous = Some(20);
+        assert_eq!(loss_window(0, 0xFF_FFFF, &mut previous).1, 0);
+        assert_eq!(loss_window(50, 6, &mut previous).1, 0, "no delta across a broken baseline");
+        // Pretend the wall clock jumped an hour: the extrapolation and the wall clock disagree.
+        let before_step = ntp_timestamp(wall_ms() - 5_000);
+        clock.base_ms -= 3_600_000;
+        assert!(clock.now().is_some(), "the sample itself is computed from the new anchor");
+        assert!(!clock.accept(before_step), "a sender report from before the step cannot measure it");
+        assert!(clock.accept(ntp_timestamp(wall_ms())), "a post-step sender report can");
+        // The 16.16 seconds field wraps every 18 hours: the comparison is a signed distance, so a
+        // report after the wrap is not mistaken for one from before it.
+        let mut wrapped = NtpClock::new();
+        let guard = std::time::Instant::now() + STEP_GUARD;
+        wrapped.not_before = Some((0x0000_0100, guard));
+        assert!(wrapped.accept(0x0000_0200), "one second after a wrapped anchor");
+        let mut stale = NtpClock::new();
+        stale.not_before = Some((0x0000_0100, guard));
+        assert!(!stale.accept(0xFFFF_FF00), "half a second before the wrap is before the anchor");
+        // The guard window ends, so a stale echo cannot reject samples for the next nine hours.
+        let mut expired = NtpClock::new();
+        expired.not_before = Some((0x0000_0100, std::time::Instant::now()));
+        assert!(expired.accept(0xFFFF_FF00));
+    }
+
     #[test]
     fn receiver_reports_only_drive_the_governor_for_the_video_ssrc() {
         use webrtc::rtcp::{reception_report::ReceptionReport, receiver_report::ReceiverReport};

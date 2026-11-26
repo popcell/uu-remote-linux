@@ -24,9 +24,19 @@ pub struct FpsAdapt { pub enabled: bool }
 
 /// One report's encoder-affecting decisions. `fps` nests: Some(Some(v)) runs the encoder at v,
 /// Some(None) lifts the governor's frame-rate floor (the viewer's nominal rate is free again),
-/// None changes nothing.
+/// None changes nothing. `cause` names what asked for a cut, for the log line.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Decision { pub cap: Option<u32>, pub fps: Option<Option<u32>> }
+pub struct Decision { pub cap: Option<u32>, pub fps: Option<Option<u32>>, pub cause: Option<Cause> }
+
+/// What lowered the cap: packets that really stayed lost, or a round trip that stayed queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause { Loss, RoundTrip }
+
+/// One receiver report's inputs. `lost_packets` is how many packets the report's own window really
+/// lost (the growth of RFC 3550 `total_lost`); 0 is what a caller passes when it cannot tell, which
+/// keeps the fraction from speaking alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Report { pub loss_percent: f32, pub lost_packets: u32, pub rtt_ms: Option<f64> }
 /// Ceiling when the viewer has no explicit limit (自动清晰度, or the viewer's "unlimited" custom rate).
 pub const AUTO_CEILING_KBPS: u32 = 8_000;
 /// A decrease restarts the encoder, so give each step time to show up in a report.
@@ -54,8 +64,21 @@ const CLEAN_QUEUE_MS: f64 = 100.0;
 /// RTT is the noisy input: one session measured 52 ms, 127 ms, 321 ms, 94 ms, 72 ms and 1300 ms,
 /// all on a path that was working. Acting on one sample that crosses the knee halves the cap, the
 /// next clean report raises it again, and every step restarts the encoder - 25 rebuilds in four
-/// minutes. A decrease therefore needs the knee crossed in this many reports in a row.
-const RTT_CONFIRMATIONS: u8 = 2;
+/// minutes. A decrease therefore needs the knee crossed for this long: report cadence is the
+/// viewer's (one report per 250 ms here), so a sample count means a different wall time per peer,
+/// and 563 ms with `lost=0` on an 18 ms direct link is one bad sample, not a queued path.
+const RTT_CONFIRM_AFTER: Duration = Duration::from_secs(2);
+/// A fraction lost is quantized by its window: 250 ms at 15-20 fps holds 3-12 RTP packets, so one
+/// reordered or NACK-recovered packet reads as 33.2 % (85/256), 24.6 % (63/256) or 8.2 % (21/256).
+/// Measured on a 17-20 ms direct link whose every report said `lost=0`: those fractions halved
+/// the cap 60 times in 29 minutes and drove an 8 Mbit/s stream to 810k. A path that is really
+/// overrun loses dozens of packets per window, so the fraction only counts when the window lost
+/// at least this many.
+const MIN_CONGESTION_LOST_PACKETS: u32 = 5;
+/// Round-trip congestion is queueing, not loss: a queue that doubles the round trip does not need
+/// the cap halved (one 300 -> 600 ms spike halved an 8 Mbit/s stream to 4 M, which is more swing
+/// than the queue asks for). Loss still halves.
+const RTT_DECREASE_PERCENT: u32 = 15;
 /// A halved rate needs more than one clean report before climbing back, otherwise a decrease is
 /// followed straight by an increase and the cap seesaws across the point where the path broke.
 const RECOVERY_AFTER_DECREASE: Duration = Duration::from_secs(10);
@@ -70,8 +93,8 @@ pub struct Governor {
     /// (or already climbed back to the viewer's rate).
     fps: Option<u32>,
     applied: Option<Instant>,
-    /// Reports in a row that asked for the knee.
-    rtt_over: u8,
+    /// When the round trip first crossed the knee in the current run of reports.
+    rtt_over_since: Option<Instant>,
     /// When the cap was last cut, to hold off the recovery that would undo it.
     decreased_at: Option<Instant>,
     /// Rate that last broke the path and when: recovery aims below it, so a path whose capacity is
@@ -110,11 +133,22 @@ impl Governor {
         }
     }
 
-    /// One RTCP receiver report: `loss_percent` is its fraction lost in percent, `ceiling_kbps`
-    /// the viewer's ceiling, `current_fps`/`ceiling_fps` the running and viewer-nominal frame
-    /// rates, `adapt` the frame-drop opt-in. Returns what the encoder must restart at.
+    /// A report of a nominal 100-packet window, so the count follows the fraction. Only tests use
+    /// this: production passes the report block's own count through `observe_report`, because a
+    /// fraction alone says nothing on a sparse window.
+    #[cfg(test)]
     pub fn observe(&mut self, loss_percent: f32, rtt_ms: Option<f64>, ceiling_kbps: u32,
         current_fps: u32, ceiling_fps: u32, adapt: &FpsAdapt, now: Instant) -> Decision {
+        let report = Report { loss_percent, lost_packets: loss_percent.max(0.0).round() as u32, rtt_ms };
+        self.observe_report(report, ceiling_kbps, current_fps, ceiling_fps, adapt, now)
+    }
+
+    /// One RTCP receiver report: `report` carries the report block's inputs, `ceiling_kbps` the
+    /// viewer's ceiling, `current_fps`/`ceiling_fps` the running and viewer-nominal frame rates,
+    /// `adapt` the frame-drop opt-in. Returns what the encoder must restart at.
+    pub fn observe_report(&mut self, report: Report, ceiling_kbps: u32,
+        current_fps: u32, ceiling_fps: u32, adapt: &FpsAdapt, now: Instant) -> Decision {
+        let (loss_percent, rtt_ms) = (report.loss_percent, report.rtt_ms);
         // The current rate is measured against the viewer's ceiling itself: clamping the
         // ceiling up to the floor would leave the governor aiming at a rate the encoder never
         // had (a 500k custom stream capped below the floor looked like an applied 800k cap,
@@ -129,25 +163,28 @@ impl Governor {
         let aim = self.broken_at
             .filter(|(_, at)| now.duration_since(*at) < PROBE_AFTER)
             .map_or(ceiling_kbps, |(broken, _)| (broken * 9 / 10).max(FLOOR_KBPS).min(ceiling_kbps));
-        // Loss at that level only shows up when a path genuinely breaks, so one report is enough. A
-        // round trip spike looks the same for a single report, so it has to hold across reports.
-        let congested = loss_percent >= CONGESTION_LOSS_PERCENT
-            || self.note_rtt(rtt_ms, CONGESTION_RTT_MS.max(base + CONGESTION_QUEUE_MS)) >= RTT_CONFIRMATIONS;
+        // Loss at that level only shows up when a path genuinely breaks, so one report is enough -
+        // as long as its window really lost that many packets. A round trip spike looks the same
+        // for a single report, so it has to hold for a while.
+        let loss_over = loss_percent >= CONGESTION_LOSS_PERCENT
+            && report.lost_packets >= MIN_CONGESTION_LOST_PACKETS;
+        let rtt_over = self.note_rtt(rtt_ms, CONGESTION_RTT_MS.max(base + CONGESTION_QUEUE_MS), now);
         let clean = loss_percent < CLEAN_LOSS_PERCENT
             && rtt_ms.is_none_or(|rtt| rtt < clean_rtt)
             && self.settled(now);
-        if congested {
-            self.rtt_over = 0;
+        if loss_over || rtt_over {
+            let cause = if loss_over { Cause::Loss } else { Cause::RoundTrip };
             // Any congestion re-arms the bitrate probe: recovery must aim below the rate that
             // caused the queue, RTT-only bufferbloat included. Only an actual loss burst,
             // however, re-arms the frame-rate window: on a 0%-loss relay whose RTT oscillates
             // 320-560 ms, refreshing it on every spike pinned frames at 5 fps for 13 minutes.
             self.broken_at = Some((current, now));
-            if loss_percent >= CONGESTION_LOSS_PERCENT { self.loss_at = Some(now); }
+            if loss_over { self.loss_at = Some(now); }
             self.decreased_at = Some(now);
-            if let Some(cap) = self.apply((current / 2).max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now) {
+            let target = if loss_over { current / 2 } else { current - current * RTT_DECREASE_PERCENT / 100 };
+            if let Some(cap) = self.apply(target.max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now) {
                 self.awaiting_first_au = false;
-                return Decision { cap: Some(cap), ..Default::default() };
+                return Decision { cap: Some(cap), fps: None, cause: Some(cause) };
             }
             // The bitrate cannot go lower: at the floor the choice is dropped frames or fewer
             // frames, and a slow-moving picture beats a frozen one (60 fps over a broken
@@ -155,7 +192,7 @@ impl Governor {
             if adapt.enabled && current <= FLOOR_KBPS {
                 if let Some(step) = self.step_fps(FPS_LADDER.iter().filter(|&&s| s < current_fps).max().copied(), DECREASE_AFTER, now) {
                     self.awaiting_first_au = false;
-                    return Decision { fps: Some(Some(step)), ..Default::default() };
+                    return Decision { cap: None, fps: Some(Some(step)), cause: Some(cause) };
                 }
             }
             return Decision::default();
@@ -213,14 +250,15 @@ impl Governor {
         Some(target)
     }
 
-    /// How many reports in a row asked for the knee. A single spike is Wi-Fi, not a broken path.
-    fn note_rtt(&mut self, sample: Option<f64>, knee_ms: f64) -> u8 {
-        self.rtt_over = if sample.is_some_and(|sample| sample >= knee_ms) {
-            self.rtt_over.saturating_add(1)
-        } else {
-            0
-        };
-        self.rtt_over
+    /// Whether the round trip has stayed over the knee long enough to act on. One sample is Wi-Fi
+    /// jitter, NTP step or a report the viewer stamped late, not a broken path.
+    fn note_rtt(&mut self, sample: Option<f64>, knee_ms: f64, now: Instant) -> bool {
+        if !sample.is_some_and(|sample| sample >= knee_ms) {
+            self.rtt_over_since = None;
+            return false;
+        }
+        let since = *self.rtt_over_since.get_or_insert(now);
+        now.duration_since(since) >= RTT_CONFIRM_AFTER
     }
 
     /// Whether the path has had time to prove that a decrease it needed holds.
@@ -250,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_round_trip_spike_leaves_the_cap_alone_but_a_sustained_one_halves_it() {
+    fn a_round_trip_spike_leaves_the_cap_alone_but_a_sustained_one_steps_down_gently() {
         let mut governor = Governor::default();
         let start = Instant::now();
         assert_eq!(report(&mut governor, start, 0.0, Some(20.0)), None);
@@ -259,9 +297,33 @@ mod tests {
         assert_eq!(report(&mut governor, start + Duration::from_secs(1), 0.0, Some(1_300.0)), None);
         assert_eq!(report(&mut governor, start + Duration::from_secs(2), 0.0, Some(72.0)), None);
         assert_eq!(governor.effective(6_000), 6_000);
-        // A round trip that stays over the knee halves the cap on the second confirming report.
+        // A round trip that stays over the knee for two seconds steps the cap down, but only by a
+        // step: queueing is not loss, and halving an 8 Mbit/s stream for a 600 ms queue is more
+        // swing than the queue asks for.
         assert_eq!(report(&mut governor, start + Duration::from_secs(3), 0.0, Some(900.0)), None);
-        assert_eq!(report(&mut governor, start + Duration::from_secs(4), 0.0, Some(900.0)), Some(3_000));
+        assert_eq!(report(&mut governor, start + Duration::from_secs(4), 0.0, Some(900.0)), None);
+        let decision = governor.observe(0.0, Some(900.0), 6_000, 60, 60, &FpsAdapt::default(), start + Duration::from_secs(5));
+        assert_eq!(decision.cap, Some(5_100));
+        assert_eq!(decision.cause, Some(Cause::RoundTrip));
+    }
+
+    #[test]
+    fn one_small_lost_window_is_not_congestion() {
+        // The measured false trigger: 33.2 % (one packet of three), 24.6 % (one of four) and 8.2 %
+        // (one of twelve) on a 17-20 ms link whose reports all said lost=0. The window's packet
+        // count says those are noise, so nothing moves.
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        let tiny = |percent, lost| Report { loss_percent: percent, lost_packets: lost, rtt_ms: Some(18.0) };
+        // 0 is what the first report of a connection (and a negative cumulative count) yields.
+        for (percent, lost, secs) in [(33.2, 1, 0), (24.6, 1, 1), (8.2, 1, 2), (52.7, 3, 3), (52.7, 0, 4)] {
+            let decision = governor.observe_report(tiny(percent, lost), 8_000, 60, 60, &FpsAdapt::default(), start + Duration::from_secs(secs));
+            assert_eq!(decision, Decision::default(), "{percent} % of {lost} packets must not move the cap");
+        }
+        assert_eq!(governor.effective(8_000), 8_000);
+        // A window that really lost packets still halves on the first report.
+        let real = Report { loss_percent: 12.5, lost_packets: 32, rtt_ms: Some(18.0) };
+        assert_eq!(governor.observe_report(real, 8_000, 60, 60, &FpsAdapt::default(), start + Duration::from_secs(5)).cap, Some(4_000));
     }
 
     #[test]
@@ -320,9 +382,10 @@ mod tests {
             at += INCREASE_AFTER;
         }
         assert_eq!(reached, Some(6_000));
-        // Queueing well above that base still counts as a backed-up path.
+        // Queueing well above that base still counts as a backed-up path, gently.
         assert_eq!(report(&mut governor, at, 0.0, Some(450.0)), None);
-        assert_eq!(report(&mut governor, at + DECREASE_AFTER, 0.0, Some(450.0)), Some(3_000));
+        let held = governor.observe(0.0, Some(450.0), 6_000, 60, 60, &FpsAdapt::default(), at + RTT_CONFIRM_AFTER + Duration::from_secs(1));
+        assert_eq!(held.cap, Some(5_100));
     }
 
     #[test]
@@ -460,13 +523,13 @@ mod tests {
         let mut governor = Governor::default();
         let start = Instant::now();
         assert_eq!(governor.observe(20.0, Some(40.0), 1_500, 60, 60, &adapt(), start).cap, Some(FLOOR_KBPS));
-        let mut at = start;
+        // The first sustained report only starts the confirmation clock; later ones are 4 s apart.
+        governor.observe(0.0, Some(320.0), 1_500, 60, 60, &adapt(), start + Duration::from_secs(1));
+        let mut at = start + Duration::from_secs(1);
         let mut fps = 60;
         while fps > 5 {
             at += Duration::from_secs(4);
-            governor.observe(0.0, Some(320.0), 1_500, fps, 60, &adapt(), at);
-            at += Duration::from_secs(1);
-            let d = governor.observe(0.0, Some(340.0), 1_500, fps, 60, &adapt(), at);
+            let d = governor.observe(0.0, Some(320.0), 1_500, fps, 60, &adapt(), at);
             assert_eq!(d.cap, None, "the floor holds");
             fps = d.fps.flatten().expect("the ladder walks down on jitter alone");
         }
@@ -481,11 +544,13 @@ mod tests {
         assert_eq!(climbed, Some(8), "frames climb the ladder once the probe window passed without loss");
         let d = governor.observe(0.0, Some(40.0), 1_500, 8, 60, &adapt(), at + Duration::from_secs(12));
         assert_eq!(d.fps, Some(Some(10)), "the climb walks one rung at a time, never jumps to the ceiling");
-        // A confirmed round-trip spike pair still answers with the bitrate halving.
+        // A confirmed round-trip hold still steps the cap down, gently and without touching the
+        // frame ladder that the quiet window had already lifted.
         at += Duration::from_secs(24);
-        governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at);
-        assert_eq!(governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at + Duration::from_secs(1)).cap,
-            Some(FLOOR_KBPS), "real queueing still halves the risen cap");
+        assert_eq!(governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at), Decision::default());
+        let held = governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at + RTT_CONFIRM_AFTER + Duration::from_secs(1));
+        assert_eq!((held.cap, held.cause), (Some(1_275), Some(Cause::RoundTrip)),
+            "real queueing still steps the risen cap down");
     }
 
     #[test]
@@ -511,19 +576,22 @@ mod tests {
     fn rtt_only_congestion_keeps_the_ninety_percent_bitrate_ceiling() {
         let mut governor = Governor::default();
         let no_fps = FpsAdapt::default();
+        let observe = |governor: &mut Governor, at: Instant, rtt: f64| governor.observe(0.0, Some(rtt), 2_400, 30, 30, &no_fps, at);
         let base_at = Instant::now();
-        governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, base_at);
+        observe(&mut governor, base_at, 40.0);
         let start = base_at + Duration::from_secs(1);
-        assert_eq!(governor.observe(0.0, Some(330.0), 2_400, 30, 30, &no_fps, start), Decision::default());
-        assert_eq!(governor.observe(0.0, Some(340.0), 2_400, 30, 30, &no_fps, start + DECREASE_AFTER + Duration::from_secs(1)).cap,
-            Some(1_200), "a confirmed RTT spike halves the cap");
+        assert_eq!(observe(&mut governor, start, 330.0), Decision::default());
+        // A queue has to hold for two seconds, not for two reports.
+        let confirmed = observe(&mut governor, start + RTT_CONFIRM_AFTER, 330.0);
+        assert_eq!(confirmed.cap, Some(2_040), "a confirmed RTT spike steps the cap down by 15 %");
+        assert_eq!(confirmed.cause, Some(Cause::RoundTrip));
         // Inside the probe window recovery must stop at 90% of the rate that broke the path.
-        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(15)).cap, Some(1_700));
-        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(19)).cap, Some(2_160));
-        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(23)).cap, None,
+        assert_eq!(observe(&mut governor, start + Duration::from_secs(15), 40.0).cap, Some(2_160),
+            "the first climb stops on the 90 % ceiling");
+        assert_eq!(observe(&mut governor, start + Duration::from_secs(19), 40.0).cap, None,
             "2,400 * 0.9 is the ceiling until the probe window expires");
         assert_eq!(governor.cap, Some(2_160));
-        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + DECREASE_AFTER + PROBE_AFTER + Duration::from_secs(2)).cap,
+        assert_eq!(observe(&mut governor, start + DECREASE_AFTER + PROBE_AFTER + Duration::from_secs(2), 40.0).cap,
             Some(2_400), "the full viewer ceiling is available again after 60 s");
     }
 

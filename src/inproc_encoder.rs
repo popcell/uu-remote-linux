@@ -86,6 +86,15 @@ extern "C" {
         out_data: *mut *const u8,
         out_len: *mut u32,
     ) -> libc::c_int;
+    /// Retunes rate control; the engine keeps its context and surfaces, so the change lands on the
+    /// next IDR - one keyframe instead of the pipeline restart this replaces.
+    fn vaapi_set_rate(
+        engine: *mut VaapiEngineOpaque,
+        target_bps: i64,
+        max_bps: i64,
+        buffer_bits: i64,
+        cq: u32,
+    );
     fn vaapi_destroy(engine: *mut VaapiEngineOpaque);
 
     fn dri3_capture_create(display_name: *const libc::c_char, width: u32, height: u32) -> *mut Dri3CaptureOpaque;
@@ -147,7 +156,27 @@ pub struct Config {
     pub chroma: u64,
     /// UU_VIDEO_ENCODER=vaapi: the VAAPI engine (H.264 / HEVC Main) instead of NVENC.
     pub vaapi: bool,
+    /// Live rate control: the connection's `RateHandle`, so a bitrate/quality step retunes this
+    /// engine instead of restarting the pipeline.
+    pub rate: Option<Arc<crate::video::RateHandle>>,
 }
+
+/// Pushes a changed rate into the running engine once per frame. Returns silently when the handle
+/// is absent or nothing changed.
+fn sync_rate(engine: &SafeVaapiEngine, rate: Option<&Arc<crate::video::RateHandle>>, applied: &mut Option<crate::video::Rate>) {
+    let Some(rate) = rate else { return };
+    let wanted = rate.get();
+    if *applied == Some(wanted) { return; }
+    unsafe { vaapi_set_rate(engine.0, wanted.target_bps, wanted.max_bps, wanted.buffer_bits, wanted.cq) };
+    log::info!("VAAPI rate control: target={}k max={}k buffer={}k min_qp={} (in place)",
+        wanted.target_bps / 1000, wanted.max_bps / 1000, wanted.buffer_bits / 1000, wanted.cq);
+    *applied = Some(wanted);
+    // Bumped here, in the encoder thread: a stalled or dead pipeline cannot claim a rate it never took.
+    rate.mark_applied();
+}
+
+/// Rate-control retunes the running engine has applied (0 when the handle is absent).
+fn rate_epoch(rate: Option<&Arc<crate::video::RateHandle>>) -> u64 { rate.map_or(0, |rate| rate.applied_epoch()) }
 
 pub fn disabled() -> bool {
     std::env::var("UU_VIDEO_PIPELINE").is_ok_and(|v| v == "process")
@@ -186,6 +215,9 @@ pub struct EncodedUnit {
     pub data: Vec<u8>,
     pub permit: OwnedSemaphorePermit,
     pub completed_at: Instant,
+    /// Rate-control retunes this engine has applied, so the send side can tell an AU from one
+    /// encoded before the retune (see `video::RateHandle`).
+    pub rate_epoch: u64,
 }
 
 fn acquire(
@@ -198,6 +230,40 @@ fn acquire(
             _ = units.closed() => None,
         }
     })
+}
+
+/// Capture-to-send segmentation for the Portal encoder, logged once a window so a stall names its
+/// own stage instead of only showing up as frame loss (duration and counts only).
+#[derive(Default)]
+struct CaptureStats {
+    window: Option<Instant>,
+    frames: u64,
+    /// Frame arrival -> rate gate open (the wait the fixed grid wasted), permit backpressure, encode.
+    /// All three are added only for an AU that was produced, so the averages describe one population.
+    gate: Duration, gate_max: Duration,
+    encode: Duration, encode_max: Duration,
+    permit: Duration, permit_max: Duration,
+    gate_last: Duration, permit_last: Duration,
+}
+impl CaptureStats {
+    /// A pass without a fresh compositor frame (a keepalive re-encode) has no arrival to measure.
+    fn gate(&mut self, arrived: Option<Instant>) { self.gate_last = arrived.map_or(Duration::ZERO, |at| at.elapsed()); }
+    fn permit(&mut self, asked: Instant) { self.permit_last = asked.elapsed(); }
+    fn encoded(&mut self, started: Instant) {
+        let took = started.elapsed();
+        self.gate += self.gate_last; self.gate_max = self.gate_max.max(self.gate_last);
+        self.permit += self.permit_last; self.permit_max = self.permit_max.max(self.permit_last);
+        self.encode += took; self.encode_max = self.encode_max.max(took); self.frames += 1;
+        let window = *self.window.get_or_insert_with(Instant::now);
+        if window.elapsed() < Duration::from_secs(10) { return; }
+        let frames = self.frames.max(1) as f64;
+        log::info!("Portal encode stats: window_s={} frames={} gate_ms_avg={:.2} gate_ms_max={} encode_ms_avg={:.2} encode_ms_max={} permit_ms_avg={:.2} permit_ms_max={}",
+            window.elapsed().as_secs(), self.frames,
+            self.gate.as_secs_f64() * 1000.0 / frames, self.gate_max.as_millis(),
+            self.encode.as_secs_f64() * 1000.0 / frames, self.encode_max.as_millis(),
+            self.permit.as_secs_f64() * 1000.0 / frames, self.permit_max.as_millis());
+        *self = CaptureStats { window: Some(Instant::now()), ..Default::default() };
+    }
 }
 
 fn random_keepalive(seed: &mut u32) -> Duration {
@@ -282,8 +348,10 @@ fn run_vaapi(
         return Err("Failed to create native VAAPI engine".into());
     }
     let engine = SafeVaapiEngine(raw_engine);
+    let mut applied = None;
+    sync_rate(&engine, config.rate.as_ref(), &mut applied);
     if let Some(portal) = config.portal.as_ref() {
-        return run_portal_vaapi(&config, portal, &engine, units, stop, idr, budget);
+        return run_portal_vaapi(&config, portal, &engine, units, stop, idr, budget, &mut applied);
     }
 
     // Capture stays at the full input size; VPP scales (or pads) to the encoder size.
@@ -324,6 +392,7 @@ fn run_vaapi(
             return Ok(());
         }
 
+        sync_rate(&engine, config.rate.as_ref(), &mut applied);
         let deadline = if dirty {
             next_tick
         } else {
@@ -399,6 +468,7 @@ fn run_vaapi(
                     data,
                     permit: send_permit,
                     completed_at: Instant::now(),
+                    rate_epoch: rate_epoch(config.rate.as_ref()),
                 })
                 .is_err()
             {
@@ -433,11 +503,22 @@ fn vaapi_packet(engine: &SafeVaapiEngine, idr: &AtomicBool) -> Result<Vec<u8>, S
 fn run_portal_vaapi(
     config: &Config, portal: &crate::portal::PortalSession, engine: &SafeVaapiEngine,
     units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    applied_rate: &mut Option<crate::video::Rate>,
 ) -> Result<(), String> {
     use crate::portal::DmaCapture;
     let interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
-    let mut next_poll = Instant::now();
+    // Event driven: the compositor's next frame wakes this loop, and `interval` only limits how
+    // often an encode may start. The fixed grid this replaced slept to the next grid slot after
+    // being woken by a frame that had already arrived, adding 0-13.3 ms (6.7 ms average at 75 fps)
+    // between capture and encode, and beat against the compositor's own refresh.
+    let mut seen = 0u64;
+    let mut next_allowed = Instant::now();
+    // Floor for a pass that produced nothing (an unchanged buffer, a pending DMA-BUF negotiation):
+    // without it a stream that owes a keepalive would re-run forever at full speed.
+    let mut next_probe = Instant::now();
     let mut last_send = Instant::now();
+    let mut available: Option<Instant> = None;
+    let mut stats = CaptureStats::default();
     let mut seed = 1;
     let mut keepalive = random_keepalive(&mut seed);
     let mut dma_version = None;
@@ -450,25 +531,44 @@ fn run_portal_vaapi(
     if dma_disabled { log::info!("Portal VAAPI DMA-BUF disabled by setting; pipeline=host-upload"); }
     loop {
         if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
-        let wait_dur = next_poll.saturating_duration_since(Instant::now());
-        if wait_dur > Duration::ZERO {
-            match portal.wait_frame(wait_dur) {
-                Ok(true) | Ok(false) => (),
-                Err(_) => {
-                    // Frame wait failed or stream closed/stalled: back off to next_poll
-                    // (preventing 100% core busy-spin) and allow existing recovery in with_dmabuf
-                    // and capture_changed to handle lock/scaling without prematurely aborting the encoder.
-                    std::thread::sleep(wait_dur);
-                }
+        sync_rate(engine, config.rate.as_ref(), applied_rate);
+        let now = Instant::now();
+        // Encode when a frame is waiting and the rate gate is open, or when the stream owes a
+        // keepalive. Otherwise sleep until one of those: the level-triggered wait wakes on the
+        // compositor's next frame, including one that arrived while the previous frame was encoded.
+        let keepalive_due = last_send.elapsed() >= keepalive || idr.load(Ordering::Acquire);
+        // A waiting frame only has to respect the rate gate; an owed keepalive also respects the
+        // probe floor, which is what stops an unchanged or negotiating source from spinning.
+        let work = now >= next_allowed && (available.is_some() || (keepalive_due && now >= next_probe));
+        if !work {
+            // Sleep until a new frame, the gate opening for a waiting one, or the next probe.
+            let deadline = if available.is_some() { next_allowed }
+                else if keepalive_due { next_probe }
+                else { last_send + keepalive };
+            let wait = deadline.saturating_duration_since(now).max(Duration::from_millis(1));
+            match portal.wait_frame(&mut seen, wait) {
+                Ok(true) => { available = Some(Instant::now()); continue; }
+                Ok(false) => continue,
+                // Stream closed or stalled: back off, then probe below so with_dmabuf and
+                // capture_changed run the existing lock/scaling recovery instead of aborting.
+                Err(_) => std::thread::sleep(wait),
             }
         }
-        let now = Instant::now();
-        if now < next_poll { continue; }
-        next_poll = (next_poll + interval).max(now);
+        next_probe = now + interval;
+        stats.gate(available.take());
         if portal.size() != config.input { return Err("Portal size changed; restart encoder".into()); }
+        let permit_started = Instant::now();
         let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
+        stats.permit(permit_started);
         if stop.load(Ordering::Relaxed) { return Ok(()); }
+        let encode_started = Instant::now();
         let due = last_send.elapsed() >= keepalive || idr.load(Ordering::Acquire);
+        // An encoder fault is not a DMA-BUF layout problem: it is reported after the lease is
+        // released and tears this pipeline down instead of degrading capture to host upload. (A
+        // timeout means the GPU may still own the frame; the lease is dropped by the closure, which
+        // is the same window every other driver error here has - the gain is that the buffers are
+        // never handed to another encode.)
+        let mut fatal: Option<String> = None;
         let captured = if dma_disabled { Ok(DmaCapture::Cpu) } else {
             portal.with_dmabuf(&mut dma_version, |frame, changed| {
                 if !changed && input_dma && !due { return Ok(None); }
@@ -477,7 +577,10 @@ fn run_portal_vaapi(
                     if result != 0 { return Err(format!("VAAPI DMA-BUF import failed: {result}")); }
                 }
                 // vaapi_encode_frame waits for VA completion before the PipeWire lease is released.
-                let packet = vaapi_packet(engine, &idr)?;
+                let packet = match vaapi_packet(engine, &idr) {
+                    Ok(packet) => packet,
+                    Err(error) => { fatal = Some(error); return Ok(None); }
+                };
                 if !input_dma {
                     log::info!("Portal VAAPI capture pipeline=dma-buf zero_cpu_copy=true source={}x{} fourcc={} modifier={}",
                         frame.width, frame.height, frame.fourcc, frame.modifier);
@@ -488,6 +591,7 @@ fn run_portal_vaapi(
                 Ok(Some(packet))
             })
         };
+        if let Some(error) = fatal { return Err(error); }
         let captured = match captured {
             Ok(DmaCapture::Unavailable(code)) => {
                 let reason = match code {
@@ -534,7 +638,11 @@ fn run_portal_vaapi(
             DmaCapture::Unavailable(_) => unreachable!(),
         };
         if data.is_empty() { continue; }
-        if units.blocking_send(EncodedUnit { data, permit, completed_at: Instant::now() }).is_err() { return Ok(()); }
+        stats.encoded(encode_started);
+        // One interval between encode *starts*, so a frame's own encode time does not stretch the
+        // period (which would cap the rate below the negotiated one).
+        next_allowed = encode_started + interval;
+        if units.blocking_send(EncodedUnit { data, permit, completed_at: Instant::now(), rate_epoch: rate_epoch(config.rate.as_ref()) }).is_err() { return Ok(()); }
         last_send = Instant::now();
         keepalive = random_keepalive(&mut seed);
     }
@@ -743,6 +851,7 @@ fn run_nvenc(
                     data,
                     permit: send_permit,
                     completed_at: Instant::now(),
+                    rate_epoch: 0,
                 })
                 .is_err()
             {
@@ -1014,7 +1123,7 @@ mod portal_hardware_tests {
                 input: portal.size(), portal: Some(portal), display: "wayland:portal".into(),
                 output: None, fps: 60, gop: 120, cq: 18, target_bps: 16_000_000,
                 max_bps: 30_000_000, buffer_bits: 500_000, codec,
-                chroma: crate::capture_setting::CHROMA_420, vaapi: true,
+                chroma: crate::capture_setting::CHROMA_420, vaapi: true, rate: None,
             };
             let (tx, rx) = mpsc::channel(4);
             let stop = Arc::new(AtomicBool::new(false));
@@ -1222,5 +1331,66 @@ mod portal_hardware_tests {
         runner.finish().await;
         println!("portal_restart_resources_passed cycles=20 fd_growth={} rss_growth_kb={} injected_lock_cycles=3",
             last.0 as i64 - warm.0 as i64, last.1 as i64 - warm.1 as i64);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+    use crate::video::{Rate, RateHandle};
+
+    /// Hardware acceptance for a live rate step: noise at 2 Mbit/s, then retune the *running* engine
+    /// to 8 Mbit/s. The second window must carry more bits, and only the retune may add a keyframe -
+    /// the context, surfaces and imported buffer stay, which is what makes this cheaper than the
+    /// pipeline restart it replaces (see `vaapi_set_rate`).
+    #[test]
+    #[ignore = "needs a VAAPI render node: cargo test --features inproc-av -- --ignored vaapi_live_rate"]
+    fn vaapi_live_rate_retune_raises_the_bitrate_with_one_keyframe() {
+        let (width, height) = (1280u32, 720u32);
+        let low = Rate { target_bps: 1_500_000, max_bps: 2_000_000, buffer_bits: 250_000, cq: 18 };
+        let high = Rate { target_bps: 6_000_000, max_bps: 8_000_000, buffer_bits: 1_000_000, cq: 18 };
+        let device = CString::new(crate::video::vaapi_device()).unwrap();
+        let ffi = VaapiConfigFFI {
+            width, height, cap_width: width, cap_height: height, fps: 60, gop: 250,
+            target_bps: low.target_bps, max_bps: low.max_bps, buffer_bits: low.buffer_bits,
+            is_hevc: 1, device: device.as_ptr(),
+        };
+        let engine = SafeVaapiEngine(unsafe { vaapi_create(&ffi) });
+        assert!(!engine.0.is_null(), "VAAPI engine unavailable on {}", crate::video::vaapi_device());
+        let rate = Arc::new(RateHandle::new(low));
+        let mut applied = None;
+        sync_rate(&engine, Some(&rate), &mut applied);
+        assert_eq!(applied, Some(low), "the first frame carries the requested rate");
+
+        let idr = AtomicBool::new(false);
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut seed = 0x1234_5678u32;
+        // Equal-rate windows of different lengths would compare total bytes, so keep both counts.
+        let (mut low_bytes, mut low_frames, mut high_bytes, mut high_frames) = (0u64, 0u64, 0u64, 0u64);
+        let mut irap_frames = 0;
+        for frame in 0..=180 {
+            if frame == 120 { rate.set(high); sync_rate(&engine, Some(&rate), &mut applied); assert_eq!(applied, Some(high)); }
+            // Full-resolution noise keeps the encoder busy, so a bitrate step is measurable.
+            for pixel in pixels.chunks_exact_mut(4) {
+                seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+                pixel.copy_from_slice(&seed.to_le_bytes());
+            }
+            assert_eq!(unsafe { vaapi_upload_host_buffer(engine.0, pixels.as_ptr(), width * 4) }, 0);
+            let packet = vaapi_packet(&engine, &idr).expect("encode");
+            assert!(!packet.is_empty(), "frame {frame} produced no access unit");
+            if crate::video::is_independent_frame_for(&packet, crate::capture_setting::VideoCodec::H265) {
+                irap_frames += 1;
+                assert!(frame == 0 || frame == 120, "only the first frame and the retune are keyframes, not {frame}");
+            }
+            match frame {
+                30..=89 => { low_bytes += packet.len() as u64; low_frames += 1; }
+                150..=179 => { high_bytes += packet.len() as u64; high_frames += 1; }
+                _ => (),
+            }
+        }
+        assert_eq!(irap_frames, 2, "the first frame and the retune, and nothing else");
+        let kbps = |bytes: u64, frames: u64| bytes as f64 * 8.0 * 60.0 / frames as f64 / 1000.0;
+        let (low, high) = (kbps(low_bytes, low_frames), kbps(high_bytes, high_frames));
+        assert!(high > low * 1.5, "the 8 Mbit/s window should carry more than 1.5x the 2 Mbit/s one: {low:.0} -> {high:.0} kbit/s");
     }
 }

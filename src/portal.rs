@@ -70,6 +70,7 @@ mod native {
         fn uu_portal_alive(portal: *mut c_void) -> i32;
         fn uu_portal_restore_sent() -> i32;
         fn uu_portal_capture_alive(portal: *mut c_void) -> i32;
+        fn uu_portal_wait_frame_since(portal: *mut c_void, seen: *mut u64, timeout_us: i64) -> i32;
         fn uu_portal_wait_frame(portal: *mut c_void, timeout_us: i64) -> i32;
         fn uu_portal_input_dispatch(portal: *mut c_void);
         fn uu_portal_reset_frame(portal: *mut c_void);
@@ -760,15 +761,31 @@ mod native {
         pub fn disable_dmabuf(&self) {
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_dmabuf_disable(handle.0.as_ptr()) }; }
         }
+        /// Whether the loaded engine exports the level-triggered wait (engines from 0.2.66 on).
+        /// Resolved once: `dlsym` on every frame wait would also warn on every frame for an old engine.
+        fn level_triggered_wait() -> bool {
+            static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *READY.get_or_init(|| {
+                #[cfg(all(target_os = "linux", feature = "engine-plugins"))]
+                { crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_wait_frame_since\0") != 0 }
+                #[cfg(not(all(target_os = "linux", feature = "engine-plugins")))]
+                { true }
+            })
+        }
         pub fn with_dmabuf<T>(&self, version: &mut Option<super::FrameVersion>,
             encode: impl FnOnce(&super::DmaFrame, bool) -> Result<T, String>,
         ) -> Result<super::DmaCapture<T>, String> {
-            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-            unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
-            // Hold the handle guard through GPU completion, so monitor swaps cannot invalidate a lease.
-            if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
-                return Ok(super::DmaCapture::Cpu);
-            }
+            // A handle is reference counted out of the mutex, so a monitor swap keeps the session (and
+            // with it the lease) alive while the GPU copies: the mutex stays free for input injection
+            // and clipboard, which otherwise waited a whole frame's GPU fence at 120 fps.
+            let handle = {
+                let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+                unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
+                if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
+                    return Ok(super::DmaCapture::Cpu);
+                }
+                Arc::clone(&*handle)
+            };
             let identity = handle.0.as_ptr() as usize;
             let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
             let mut frame = super::DmaFrame::default();
@@ -778,10 +795,24 @@ mod native {
                     impl Drop for Lease {
                         fn drop(&mut self) { unsafe { uu_portal_dmabuf_release(self.0) }; }
                     }
-                    let _lease = Lease(handle.0.as_ptr());
-                    if code == 0 { self.note_frame(); }
-                    let encoded = encode(&frame, code == 0)?;
-                    *version = Some(super::FrameVersion(identity, revision));
+                    let encoded = {
+                        let _lease = Lease(handle.0.as_ptr());
+                        encode(&frame, code == 0)?
+                    };
+                    // The lease (and the PipeWire lock it pins) is gone before the mutex is taken
+                    // again: input dispatch holds that mutex and wants this same PipeWire lock.
+                    let current = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+                    if Arc::ptr_eq(&handle, &*current) {
+                        if code == 0 { self.note_frame(); }
+                        *version = Some(super::FrameVersion(identity, revision));
+                    } else {
+                        // A monitor swap installed another session while the GPU held this lease. The
+                        // AU belongs to the old source and is still sent - the encoder has already
+                        // advanced its reconstruction, so dropping it would leave the decoder one
+                        // reference behind - but it is no proof for the new session and its frame
+                        // version no longer applies.
+                        *version = None;
+                    }
                     Ok(super::DmaCapture::Frame(encoded))
                 },
                 10 => Ok(super::DmaCapture::Pending),
@@ -876,11 +907,22 @@ mod native {
         pub fn clipboard_supported(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_clipboard_supported(handle.0.as_ptr()) != 0 })
         }
-        pub fn wait_frame(&self, timeout: std::time::Duration) -> Result<bool, String> {
+        /// Waits until the compositor produced a frame newer than `seen` (which is advanced to the
+        /// newest sequence) or `timeout` passes. Level triggered, so a frame that arrived while the
+        /// previous one was still being encoded is not missed.
+        pub fn wait_frame(&self, seen: &mut u64, timeout: std::time::Duration) -> Result<bool, String> {
             let handle = lease_handle(&self.handle)?;
             // Retain sub-millisecond precision across the FFI boundary and clamp to 5s.
             let us = (timeout.as_micros().min(5_000_000) as i64).max(1);
-            let ret = unsafe { uu_portal_wait_frame(handle.0.as_ptr(), us) };
+            let ret = if Self::level_triggered_wait() {
+                let mut sequence = *seen;
+                let ret = unsafe { uu_portal_wait_frame_since(handle.0.as_ptr(), &mut sequence, us) };
+                *seen = sequence;
+                ret
+            } else {
+                // An engine older than the seen-sequence API only reports a change since this call.
+                unsafe { uu_portal_wait_frame(handle.0.as_ptr(), us) }
+            };
             if ret < 0 {
                 Err("Portal stream closed or failed during frame wait".into())
             } else {
@@ -1334,7 +1376,7 @@ impl PortalSession {
     pub fn capture(&self, _: &mut [u8]) -> Result<(), String> { Err(error(15)) }
     pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(15)) }
     pub fn disable_dmabuf(&self) {}
-    pub fn wait_frame(&self, _: std::time::Duration) -> Result<bool, String> { Err(error(15)) }
+    pub fn wait_frame(&self, _: &mut u64, _: std::time::Duration) -> Result<bool, String> { Err(error(15)) }
     pub fn with_dmabuf<T>(&self, _: &mut Option<FrameVersion>, _: impl FnOnce(&DmaFrame, bool) -> Result<T, String>) -> Result<DmaCapture<T>, String> {
         Ok(DmaCapture::Unavailable(-1))
     }

@@ -87,7 +87,7 @@ where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Byte
                     _ = updates.changed() => continue,
                     _ = locked.changed() => continue,
                     result = tokio::time::timeout(Duration::from_secs(2),
-                        track.write_sample_with_extensions(*codec, &sample, &extensions)) => {
+                        track.write_sample_with_extensions(*codec, &sample, &extensions, 0, 0)) => {
                         if crate::video::transport_closed(pc) { return Ok(()); }
                         result.map_err(|_| "Locked desktop video send timed out".to_string())?
                             .map_err(|error| format!("Locked desktop video send: {error}"))?;

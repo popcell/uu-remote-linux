@@ -904,18 +904,28 @@ int uu_portal_capture_alive(struct uu_portal *p) {
     pthread_mutex_unlock(&p->lock);
     return alive;
 }
-int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+/* Level triggered when `seen` is given: it holds the frame sequence the caller has already
+ * consumed, so a frame that arrived while the caller was encoding wakes this call instead of waiting
+ * for the next one. (Comparing against the sequence at entry, as the pre-0.2.66 entry point below
+ * still does, made every early wake-up reset the baseline: the caller then slept to its next slot and
+ * encoded up to one interval late - 0-13.3 ms at 75 fps, with a fixed 75.000 Hz grid beating against
+ * the compositor.) `seen` is updated to the newest sequence on every non-error return. */
+static int portal_wait_frame(struct uu_portal *p, uint64_t *seen, int64_t timeout_us) {
     if (!p || atomic_load(&p->closed)) return -1;
     pthread_mutex_lock(&p->lock);
     if (p->error || atomic_load(&p->closed) || stream_stalled(p)) {
         pthread_mutex_unlock(&p->lock);
         return -1;
     }
-    uint64_t prev_seq = p->sequence;
-    if (timeout_us <= 0) {
-        int ready = (p->sequence != prev_seq);
+    uint64_t prev_seq = seen ? *seen : p->sequence;
+    if (seen && p->sequence != prev_seq) {
+        *seen = p->sequence;
         pthread_mutex_unlock(&p->lock);
-        return ready;
+        return 1;
+    }
+    if (timeout_us <= 0) {
+        pthread_mutex_unlock(&p->lock);
+        return 0;
     }
     struct timespec until;
     clock_gettime(CLOCK_MONOTONIC, &until);
@@ -931,9 +941,22 @@ int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
     }
     int res = (p->error || atomic_load(&p->closed) || stream_stalled(p)) ? -1 :
               (p->sequence != prev_seq) ? 1 : 0;
+    if (res >= 0 && seen) *seen = p->sequence;
     pthread_mutex_unlock(&p->lock);
     return res;
 }
+
+/* Level-triggered entry point (hosts from 0.2.66 on). */
+int uu_portal_wait_frame_since(struct uu_portal *p, uint64_t *seen, int64_t timeout_us) {
+    if (!seen) return -1;
+    return portal_wait_frame(p, seen, timeout_us);
+}
+
+/* Kept so a host binary from before the seen-sequence API still runs against this engine. */
+int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+    return portal_wait_frame(p, NULL, timeout_us);
+}
+
 void uu_portal_input_dispatch(struct uu_portal *p) {
     if (p->ei) portal_eis_dispatch(p);
 }

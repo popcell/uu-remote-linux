@@ -233,7 +233,7 @@ async fn exercise_locked_video(codec: VideoCodec) {
             data: live_data,
             duration: Duration::from_millis(20),
             ..Default::default()
-        }, &[]).await.unwrap();
+        }, &[], 0, 0).await.unwrap();
         let live_frame = receive_frame(&mut peers.packets, Duration::from_secs(5)).await;
         assert_single_rtp_frame(&live_frame);
         let first_live_packet = &live_frame[0];

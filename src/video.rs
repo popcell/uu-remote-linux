@@ -151,7 +151,7 @@ fn au_offsets_for(bytes: &[u8], codec: VideoCodec) -> Vec<usize> {
         VideoCodec::H265 => hevc_au_offsets(bytes),
     }
 }
-fn is_independent_frame_for(bytes: &[u8], codec: VideoCodec) -> bool {
+pub(crate) fn is_independent_frame_for(bytes: &[u8], codec: VideoCodec) -> bool {
     match codec {
         VideoCodec::H264 => !nal_offsets_for(bytes, 5, codec).is_empty() && nal_offsets_for(bytes, 1, codec).is_empty(),
         // BLA/IDR/CRA are IRAP (RFC 7798 §4.1); no leading pictures with our no-B-frame encoder.
@@ -186,6 +186,10 @@ struct CompleteFrame {
     source_generation: u64,
     codec: VideoCodec,
     sequence: u64,
+    /// Which encoder configuration produced this AU (see `next_encode_generation`).
+    generation: u64,
+    /// Rate-control retunes the producing engine had applied when it encoded this AU.
+    rate_epoch: u64,
     completed_at: Instant,
     data: bytes::Bytes,
     _permit: Option<OwnedSemaphorePermit>,
@@ -198,6 +202,14 @@ impl CompleteFrame {
 }
 
 const RTP_CLOCK: u64 = 90_000;
+
+/// Bumped every time an encoder pipeline starts, so an AU carries the configuration that made it.
+/// The governor resumes climbing only on the first AU of a *new* pipeline: the track's global frame
+/// counter is also satisfied by a frame the replaced pipeline had already queued for sending.
+fn next_encode_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
@@ -762,7 +774,7 @@ async fn read_encoder(
     size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     latest: mpsc::Sender<Arc<CompleteFrame>>,
     mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
-    selection: crate::video_select::Selection,
+    selection: crate::video_select::Selection, rate: Option<Arc<RateHandle>>,
 ) -> Result<(), String> {
     #[cfg(test)]
     if display == wake_tests::DISPLAY { return wake_tests::encode(latest, settings, sequence, budget).await; }
@@ -773,16 +785,16 @@ async fn read_encoder(
         settings.chroma = crate::capture_setting::CHROMA_420;
         log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
     }
-    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection).await; }
+    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection,rate).await; }
     let try_vpp = encoder == Encoder::Vaapi && vaapi_vpp_wanted();
     #[allow(unused_mut)]
-    let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+    let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection,rate.clone()).await;
     // A failed native session still leaves the matching FFmpeg hardware pipeline.
     #[cfg(feature = "inproc-av")]
     if let Err(error) = &result {
         if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
-            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection,rate.clone()).await;
         }
     }
     // If GPU VPP RGB upload failed on this driver, fall back to software NV12 + hardware VAAPI
@@ -791,14 +803,14 @@ async fn read_encoder(
         if try_vpp && !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none() {
             VAAPI_VPP_FALLBACK.store(true, Ordering::Release);
             log::warn!("{} VPP filter unavailable; falling back to software NV12 upload: {}", encoder.name_for(settings.codec), error);
-            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection,rate.clone()).await;
         }
     }
     match result {
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
-            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection).await
+            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection,rate).await
         },
         Err(error)=>Err(error),
     }
@@ -842,6 +854,7 @@ fn display_kind(display: &str, portal: bool) -> NativeDisplayKind {
 async fn read_inprocess(
     config: crate::inproc_encoder::Config, latest: mpsc::Sender<Arc<CompleteFrame>>,
     sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>, source: (usize, u64),
+    generation: u64,
 ) -> Result<(), String> {
     let codec = config.codec;
     let (units_tx, mut units) = mpsc::channel::<crate::inproc_encoder::EncodedUnit>(4);
@@ -857,7 +870,7 @@ async fn read_inprocess(
     let mut gate = DependencyGate::default();
     while let Some(unit) = units.recv().await {
         let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        gate.submit(&latest, Arc::new(CompleteFrame { source_generation: source.1, source_id: source.0, codec, sequence, completed_at: unit.completed_at, data: unit.data.into(), _permit: Some(unit.permit) }));
+        gate.submit(&latest, Arc::new(CompleteFrame { source_generation: source.1, source_id: source.0, codec, sequence, generation, rate_epoch: unit.rate_epoch, completed_at: unit.completed_at, data: unit.data.into(), _permit: Some(unit.permit) }));
         if latest.is_closed() { break; }
     }
     // Dropping the receiver also unblocks the encoder if it is waiting to send.
@@ -889,6 +902,51 @@ fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
 fn buffer_ms_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
     let ms = value?.trim().parse::<u32>().ok().filter(|ms| (10..=1000).contains(ms))?;
     Some((max_kbps.saturating_mul(ms) / 1000).max(1))
+}
+
+/// Live rate-control values of the in-process VAAPI engine. A governor step retunes the running
+/// engine instead of restarting it: a restart is a pipeline teardown plus a keyframe burst into
+/// exactly the path that just asked for less (measured: six restarts inside one minute on a path
+/// whose reports said `lost=0`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Rate { pub target_bps: i64, pub max_bps: i64, pub buffer_bits: i64, pub cq: u32 }
+
+/// Carries a bitrate/quality step to the blocking encoder thread; `active` tells whether a pipeline
+/// that can apply it in place is running (only the in-process VAAPI engine can), and `applied` counts
+/// the retunes that engine has really taken.
+pub struct RateHandle { rate: Mutex<Rate>, active: AtomicBool, applied: std::sync::atomic::AtomicU64 }
+impl RateHandle {
+    pub fn new(rate: Rate) -> Self {
+        Self { rate: Mutex::new(rate), active: AtomicBool::new(false), applied: std::sync::atomic::AtomicU64::new(0) }
+    }
+    pub fn set(&self, rate: Rate) { *self.rate.lock().unwrap_or_else(|e| e.into_inner()) = rate; }
+    pub fn get(&self) -> Rate { *self.rate.lock().unwrap_or_else(|e| e.into_inner()) }
+    pub fn active(&self) -> bool { self.active.load(Ordering::Acquire) }
+    pub fn activate(&self) { self.active.store(true, Ordering::Release); }
+    pub fn deactivate(&self) { self.active.store(false, Ordering::Release); }
+    /// Called by the encoder thread after it pushed a rate into the engine.
+    pub fn mark_applied(&self) { self.applied.fetch_add(1, Ordering::AcqRel); }
+    pub fn applied_epoch(&self) -> u64 { self.applied.load(Ordering::Acquire) }
+}
+
+fn rate_for(settings: &VideoSettings, encoder: Encoder) -> Rate {
+    Rate {
+        target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
+        max_bps: i64::from(settings.max_kbps().unwrap_or(30_000)) * 1000,
+        buffer_bits: i64::from(buffer_for(settings, encoder)) * 1000,
+        cq: settings.cq() as u32,
+    }
+}
+
+/// True when the only difference is rate control the in-process VAAPI engine retunes in place:
+/// the bitrate cap and the quality preset (its minimum QP). Codec, source, geometry, chroma and
+/// frame rate all need a new pipeline.
+fn rate_only_change(current: &VideoSettings, next: &VideoSettings) -> bool {
+    let mut probe = *current;
+    probe.net_kbps = next.net_kbps;
+    probe.quality = next.quality;
+    probe.custom_bps = next.custom_bps;
+    probe == *next
 }
 
 fn buffer_for(settings: &VideoSettings, encoder: Encoder) -> u32 {
@@ -968,9 +1026,20 @@ async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,
     #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool, vaapi_vpp: bool, sequence:Arc<std::sync::atomic::AtomicU64>,
     settings: VideoSettings, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
-    selection: crate::video_select::Selection,
+    selection: crate::video_select::Selection, rate: Option<Arc<RateHandle>>,
 )->Result<(),String>{
+    // A retune may have landed after this reader was created, and a fallback inside this reader would
+    // otherwise start at the rate that retune replaced: every pipeline starts from the newest one.
+    let mut settings = settings;
+    if let Some(rate) = rate.as_ref().filter(|rate| rate.active()) {
+        settings.net_kbps = Some((rate.get().max_bps / 1000) as u32);
+    }
+    // Only an in-process VAAPI pipeline can retune its rate control in place; claim the handle here
+    // so a restart onto another path clears any stale claim.
+    if let Some(rate) = rate.as_ref() { rate.deactivate(); }
     let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
+    // Every pipeline start gets its own generation, whatever encoder or path it runs.
+    let generation = next_encode_generation();
     // Portal frames come from the session's current monitor, whatever the advertised mode says.
     let size=portal.as_ref().map(|p|p.size()).or(selected_output.map(|s|(s.width,s.height))).unwrap_or(size);
     let kms=display.starts_with("kms:");
@@ -986,18 +1055,28 @@ async fn read_encoder_with(
     #[cfg(feature = "inproc-av")]
     if allow_inproc && x11_region.is_none() && native_inproc(&display, portal.is_some(), encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
+        let live_rate = rate_for(&settings, encoder);
         let config = crate::inproc_encoder::Config {
             portal: portal.clone(),
             display: display.clone(), input: size, output: settings.output, fps: settings.effective_fps(),
             gop: gop_frames(settings.effective_fps(), true) as u32, cq: settings.cq() as u32,
-            target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
-            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
+            target_bps: live_rate.target_bps, max_bps: live_rate.max_bps, buffer_bits: live_rate.buffer_bits,
+            codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
+            // A VAAPI rate step must not reopen the pipeline (a restart is a keyframe burst into
+            // the path the governor just stepped down for); the handle retunes it in place.
+            rate: if encoder == Encoder::Vaapi {
+                if let Some(rate) = rate.as_ref() {
+                    rate.set(live_rate);
+                    rate.activate();
+                }
+                rate
+            } else { None },
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.effective_fps(),config.cq,max_kbps,encoder.name_for(settings.codec),
             crate::video_select::encoder_source_label(selection.encoder_source));
-        return read_inprocess(config, latest, sequence, idr, budget, (settings.source_id, settings.source_generation)).await;
+        return read_inprocess(config, latest, sequence, idr, budget, (settings.source_id, settings.source_generation), generation).await;
     }
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
@@ -1164,7 +1243,7 @@ async fn read_encoder_with(
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame { source_generation: settings.source_generation, source_id: settings.source_id,
-                codec: settings.codec, sequence, completed_at: Instant::now(), data: frame, _permit: permit,
+                codec: settings.codec, sequence, generation, rate_epoch: 0, completed_at: Instant::now(), data: frame, _permit: permit,
             }));
             if latest.is_closed() { return Ok(()); }
         }
@@ -1296,7 +1375,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     let (tx,mut rx)=mpsc::channel(4);
     let sequence=Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (selection, settings)=probe_plan()?;
-    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)),selection)));
+    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)),selection,None)));
     let mut count=0;
     let mut bytes=0;
     // UU_PROBE_FRAMES lengthens the sample for baseline measurements; default is 5 frames.
@@ -1378,6 +1457,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // Only a SIGUSR2 since the session snapshot. A probe that finishes during setup is not a reload
     // (sessions started before the probe keep the legacy encoder for their lifetime).
     let mut reload_pending = crate::video_select::reload_since_session(reload_at_session, *reload.borrow());
+    // A bitrate/quality step of the in-process VAAPI engine retunes the running pipeline; the
+    // handle is created once per connection so a restart keeps carrying the viewer's latest choice.
+    let rate = Arc::new(RateHandle::new(rate_for(&current, live_selection.encoder)));
     let open = {
         let display = display.clone();
         let portal = portal.clone();
@@ -1385,8 +1467,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         let sequence = sequence.clone();
         let idr = idr.clone();
         let budget = budget.clone();
+        let rate = rate.clone();
         move |size: (u32, u32), selection: crate::video_select::Selection, settings: VideoSettings| {
-            read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection)
+            read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection, Some(rate.clone()))
         }
     };
     let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
@@ -1446,6 +1529,16 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         let next = *settings.borrow_and_update();
         if encoder_changed(&current, &next) || send_interrupted {
             let discard = needs_hard_discard(&current, &next) || send_interrupted;
+            // The handle always carries the newest desired rate, so a pipeline (or a fallback inside
+            // one) that starts later does not inherit the snapshot its reader was created with.
+            rate.set(rate_for(&next, live_selection.encoder));
+            if !discard && rate.active() && rate_only_change(&current, &next) {
+                // Retune the running VAAPI engine: same context, same surfaces, only the next keyframe.
+                log::info!("Desktop encoder rate: {}k -> {}k cq={} -> {} (in place)",
+                    current.max_kbps().unwrap_or(0), next.max_kbps().unwrap_or(0), current.cq(), next.cq());
+                current = next;
+                continue;
+            }
             current = next;
             timeline.fps = u64::from(next.effective_fps());
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
@@ -1525,7 +1618,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let sent_before=track.revision();
-                let send = track.write_sample_with_extensions(frame.codec, &sample, &extensions);
+                let send = track.write_sample_with_extensions(frame.codec, &sample, &extensions, frame.generation, frame.rate_epoch);
                 let send_started=Instant::now();
                 tokio::pin!(send);
                 loop {
@@ -1564,6 +1657,23 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_rate_control_changes_are_retuned_in_place() {
+        use crate::capture_setting::{QUALITY_HD, QUALITY_FAST};
+        let base = VideoSettings { quality: QUALITY_FAST, ..Default::default() };
+        let capped = VideoSettings { net_kbps: Some(4_000), ..base };
+        assert!(super::rate_only_change(&base, &capped), "a governor cap is a rate step");
+        assert!(super::rate_only_change(&capped, &base), "and so is lifting it");
+        assert!(super::rate_only_change(&base, &VideoSettings { quality: QUALITY_HD, ..base }), "a quality preset is its min QP");
+        // Everything else needs a new pipeline.
+        assert!(!super::rate_only_change(&base, &VideoSettings { fps: 90, ..base }));
+        assert!(!super::rate_only_change(&base, &VideoSettings { net_fps: Some(30), ..base }));
+        assert!(!super::rate_only_change(&base, &VideoSettings { codec: VideoCodec::H265, ..base }));
+        assert!(!super::rate_only_change(&base, &VideoSettings { output: Some((1280, 720)), ..base }));
+        assert!(!super::rate_only_change(&base, &VideoSettings { chroma: crate::capture_setting::CHROMA_444, ..base }));
+        assert!(!super::rate_only_change(&base, &VideoSettings { source_generation: base.source_generation + 1, ..base }));
+    }
+
     #[test]
     fn auto_quality_encodes_at_the_8m_ceiling() {
         assert_eq!(super::rate_args(&crate::capture_setting::VideoSettings::default(), super::Encoder::Cpu).0,
@@ -1678,7 +1788,7 @@ mod tests {
         let mut gate=DependencyGate::default();
         for sequence in 1..=2 {
             let permit=budget.clone().acquire_owned().await.unwrap();
-            gate.submit(&tx,Arc::new(CompleteFrame { source_generation: 0, source_id: 0,codec:VideoCodec::H264,sequence,completed_at:Instant::now(),
+            gate.submit(&tx,Arc::new(CompleteFrame { source_generation: 0, source_id: 0,codec:VideoCodec::H264,sequence,generation:0,rate_epoch:0,completed_at:Instant::now(),
                 data:vec![0,0,1,5,42].into(),_permit:Some(permit)}));
         }
         let sending=rx.recv().await.unwrap();
@@ -1897,7 +2007,7 @@ mod tests {
         let old_tx = tx.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let frame = |sequence, idr| Arc::new(CompleteFrame { source_generation: 0, source_id: 0, _permit: None,
-            sequence, codec: VideoCodec::H264, completed_at: Instant::now(),
+            sequence, generation: 0, rate_epoch: 0, codec: VideoCodec::H264, completed_at: Instant::now(),
             data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42].into(),
         });
         let mut reader = EncoderTask(tokio::spawn(async move {
@@ -1991,7 +2101,7 @@ mod tests {
     async fn bounded_queue_never_sends_broken_prediction_chain_after_overload(){
         let(tx,mut rx)=mpsc::channel(1);
         let mut gate=DependencyGate::default();
-        let frame=|sequence,idr|Arc::new(CompleteFrame{source_generation:0,source_id:0,_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42].into()});
+        let frame=|sequence,idr|Arc::new(CompleteFrame{source_generation:0,source_id:0,_permit:None,sequence,generation:0,rate_epoch:0,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42].into()});
         gate.submit(&tx,frame(1,false));assert!(rx.try_recv().is_err()); // no IDR yet
         gate.submit(&tx,frame(2,true));
         gate.submit(&tx,frame(3,false)); // queue full: P3 lost
@@ -2064,7 +2174,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut gate = DependencyGate::default();
         let frame = |sequence, irap| Arc::new(CompleteFrame { source_generation: 0, source_id: 0, _permit: None, codec: VideoCodec::H265,
-            sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42].into() });
+            sequence, generation: 0, rate_epoch: 0, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42].into() });
         gate.submit(&tx, frame(1, false));
         assert!(rx.try_recv().is_err());
         gate.submit(&tx, frame(2, true));
@@ -2112,7 +2222,7 @@ mod screen_frame_tests {
     use super::*;
     #[test]
     fn source_restart_rejects_queued_frames_even_with_same_screen_and_codec() {
-        let frame=CompleteFrame {source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),data:vec![].into(),_permit:None};
+        let frame=CompleteFrame {source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,generation:0,rate_epoch:0,completed_at:Instant::now(),data:vec![].into(),_permit:None};
         let mut settings=VideoSettings {source_id:0,source_generation:7,..Default::default()};
         assert!(frame.matches(&settings));
         settings.source_generation=9;assert!(!frame.matches(&settings));

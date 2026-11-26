@@ -36,6 +36,9 @@ int uu_portal_alive(struct uu_portal *portal);
 int uu_portal_capture_alive(struct uu_portal *portal);
 /* Wait for a new frame or status change with a timeout in microseconds.
  * Returns 1 if a new frame or status change occurred, 0 on timeout, <0 on closed/error. */
+/* *seen is the frame sequence already consumed; updated to the newest on return. */
+int uu_portal_wait_frame_since(struct uu_portal *portal, uint64_t *seen, int64_t timeout_us);
+/* Pre-0.2.66 semantics (waits for a change since this call), for older host binaries. */
 int uu_portal_wait_frame(struct uu_portal *portal, int64_t timeout_us);
 void uu_portal_input_dispatch(struct uu_portal *portal);
 void uu_portal_logical_size(struct uu_portal *portal, uint32_t *width, uint32_t *height);

@@ -29,16 +29,30 @@ point the RTT is seconds and the picture is already dead.
 
 `src/video_governor.rs` keeps the encoder's bitrate cap at or below what RTCP says the path carries.
 It reads the receiver reports the feedback task already parses and, when the cap changes, writes
-`VideoSettings.net_kbps`; the existing settings watch restarts the encoder through its normal
-`reader.restart` path (RTP timeline preserved, first frame is an IDR).
+`VideoSettings.net_kbps`. The in-process VAAPI engine retunes its rate control in place: context,
+surfaces and imported buffer stay, the change lands on the next IDR (`vaapi_set_rate`), and the
+stream loop reports the retune through `VideoTrack::note_rate_applied` so the governor's climb gate
+does not wait for a pipeline restart that never comes. Every other pipeline goes through the
+settings watch and its normal `reader.restart` path (RTP timeline preserved, first frame is an IDR).
 
-- Signals: `fraction_lost >= 8%` or `rtcp_rtt_ms >= 300`. NACK counts are deliberately **not** a
-  trigger: they arrive in bursts (hundreds within 100 ms on a clean path), so an instantaneous rate
-  reads as congestion on a perfect link and makes the cap sawtooth (measured 0% loss, 18 ms RTT being
-  halved).
-- Decrease: halve, floor 800 kbit/s, at most every 3 s. The rate that broke the path is remembered and
-  recovery aims at 90% of it, so a path whose capacity is 3 Mbit/s does not retry 3.1 Mbit/s every
-  twenty seconds.
+- Signals: a `fraction_lost >= 8%` window that really lost packets, or a round trip that stayed over
+  300 ms (or 250 ms above the session's lowest sample) for two seconds.
+  - A fraction alone is not evidence: a 250 ms report window on a sparse desktop stream (15-20 fps,
+    one RTP packet per frame) holds 3-12 packets, so one reordered or NACK-recovered packet reads as
+    33.2 % (85/256), 24.6 % (63/256) or 8.2 % (21/256). Measured on a 17-20 ms direct link whose every
+    report said `lost=0`: those fractions halved the cap about 60 times in 29 minutes, drove an
+    8 Mbit/s stream to 810k and restarted the encoder each time. The growth of RFC 3550's cumulative
+    lost count is what separates that from congestion, so a window must lose at least
+    `MIN_CONGESTION_LOST_PACKETS` (5) before its fraction counts; a path that breaks loses dozens.
+  - The round trip is noisy in single samples (measured 563 ms and 1300 ms on an 18 ms link). It is
+    confirmed by how long it stays over the knee, not by a report count, because the report cadence
+    belongs to the viewer. The sample itself is computed on a monotonic base so an NTP step does not
+    read as queueing.
+  - NACK counts are deliberately **not** a trigger: they arrive in bursts (hundreds within 100 ms on a
+    clean path), so an instantaneous rate reads as congestion on a perfect link.
+- Decrease: halve on loss, 15 % on a round trip alone (queueing is not loss), floor 800 kbit/s, at most
+  every 3 s. The rate that broke the path is remembered and recovery aims at 90 % of it, so a path
+  whose capacity is 3 Mbit/s does not retry 3.1 Mbit/s every twenty seconds.
 - Increase: +25% (at least 500 kbit/s) every 4 s, never above the aim. After 60 s without loss the aim
   is ignored once, which is the only way to discover that the path improved.
 - Ceiling: the viewer's own choice (`max_kbps`) stays the ceiling; when it is absent or unlimited, the
@@ -54,8 +68,18 @@ own settings keep their meaning (`requested_kbps()` vs `max_kbps()`).
 
 `cargo test --bin uuremote-server video_governor` covers the halving sequence down to the floor, a
 swollen RTT alone, 3.5% and 6% jitter leaving the cap alone, recovery stopping at 90% of the broken
-rate, the 60 s probe reaching the viewer ceiling again, and an unlimited viewer choice being capped at
-8 Mbit/s.
+rate, the 60 s probe reaching the viewer ceiling again, an unlimited viewer choice being capped at
+8 Mbit/s, and windows of one lost packet in three, four or twelve (33.2 %, 24.6 %, 8.2 %) leaving the
+cap alone. `webrtc::network_tests` covers the window count, the wall-clock step and the NACK
+attribution.
+
+The live rate retune has a hardware acceptance test:
+`cargo test --features inproc-av --bin uuremote-server -- --ignored vaapi_live_rate`. It encodes
+noise at 2 Mbit/s, retunes the running engine to 8 Mbit/s and requires more than 1.5x the bitrate
+with only the retune's keyframe, no pipeline restart. Measured on Intel Gen12 LP HEVC (UHD 730, iHD):
+2.9 -> 5.9 Mbit/s. On that driver a rate change only takes effect at an IDR - a resubmitted
+rate-control or sequence buffer on a low-delay P frame moved the output by 4 % - so
+`vaapi_set_rate` arms one keyframe instead of the engine teardown this replaced.
 
 Field check: with a 1-3 Mbit/s mobile path the log shows `Video bitrate cap` only after real loss
 (12-27%) and the picture recovers instead of freezing; at 8 Mbit/s over a good path the governor never
@@ -66,7 +90,9 @@ transport.
 ## Tuning
 
 The thresholds are constants at the top of `src/video_governor.rs`
-(`CONGESTION_LOSS_PERCENT`, `CLEAN_LOSS_PERCENT`, `DECREASE_AFTER`, `INCREASE_AFTER`, `PROBE_AFTER`,
-`FLOOR_KBPS`, `AUTO_CEILING_KBPS`). Raising the loss threshold means fewer encoder restarts and
-longer tolerance of jitter; lowering it reacts earlier at the cost of a visible hiccup (each change
-restarts the encoder, because the encoder cannot change its bitrate while running).
+(`CONGESTION_LOSS_PERCENT`, `MIN_CONGESTION_LOST_PACKETS`, `RTT_CONFIRM_AFTER`,
+`CLEAN_LOSS_PERCENT`, `DECREASE_AFTER`, `INCREASE_AFTER`, `PROBE_AFTER`, `FLOOR_KBPS`,
+`AUTO_CEILING_KBPS`) and `MIN_CONGESTION_LOST_PACKETS`/`loss_window` in `src/webrtc.rs`. Raising the
+loss threshold means fewer keyframes and longer tolerance of jitter; lowering it reacts earlier at
+the cost of a visible hiccup (a step costs one keyframe on the live-retune path, and a full encoder
+restart on the pipelines that cannot retune).
