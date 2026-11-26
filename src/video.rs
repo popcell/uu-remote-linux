@@ -229,10 +229,21 @@ fn chroma_args(settings: &VideoSettings, encoder: Encoder) -> (&'static str, &'s
 }
 pub(crate) fn vaapi_device() -> String { std::env::var("UU_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into()) }
 
-/// NV12 conversion must precede upload; scaling runs on software frames, before hwupload.
+/// Software NV12 conversion + upload fallback (and fixed-input probe where pixel format varies).
 fn vaapi_filter(output: Option<(u32, u32)>) -> String {
     let scale = output.map_or(String::new(), |(w,h)| format!("scale={w}:{h}:flags=bilinear,"));
     format!("{scale}format=nv12,hwupload")
+}
+/// GPU VPP RGB->NV12 conversion (+ scaling) on the VAAPI render node. Explicit BT.709 + TV range
+/// prevents `scale_vaapi` from tagging 4:2:0 output as `color_space=gbr` / `yuvj420p` on Intel iHD,
+/// which would corrupt colors in Apple VideoToolbox.
+fn vaapi_vpp_filter(input_fmt: &str, output: Option<(u32, u32)>) -> String {
+    let size = output.map_or(String::new(), |(w, h)| format!("w={w}:h={h}:"));
+    format!("format={input_fmt},hwupload,scale_vaapi={size}format=nv12:out_color_matrix=bt709:out_range=tv")
+}
+static VAAPI_VPP_FALLBACK: AtomicBool = AtomicBool::new(false);
+fn vaapi_vpp_wanted() -> bool {
+    std::env::var("UU_VAAPI_VPP").as_deref() != Ok("0") && !VAAPI_VPP_FALLBACK.load(Ordering::Acquire)
 }
 fn vaapi_options(settings: &VideoSettings, gop: &str) -> Vec<String> {
     let (maxrate, buffer) = rate_args(settings, Encoder::Vaapi);
@@ -333,10 +344,19 @@ fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: O
 /// 正在传输画面 spinner. When the native capture size is odd, pad the odd row/column; the host
 /// display mode and every reported capture setting stay untouched.
 fn scale_options(settings: &VideoSettings, encoder: Encoder, source: Option<(u32,u32)>) -> Vec<String> {
+    scale_options_for(settings, encoder, source, None)
+}
+
+fn scale_options_for(settings: &VideoSettings, encoder: Encoder, source: Option<(u32,u32)>, vaapi_vpp_input: Option<&str>) -> Vec<String> {
     const EVEN_PAD: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black";
     let odd_capture = settings.output.is_none() && source.is_some_and(|(w,h)| w % 2 != 0 || h % 2 != 0);
     if encoder == Encoder::Vaapi {
-        let filtered = if odd_capture { format!("{EVEN_PAD},{}", vaapi_filter(None)) } else { vaapi_filter(settings.output) };
+        let out = if odd_capture { None } else { settings.output };
+        let base = match vaapi_vpp_input {
+            Some(fmt) => vaapi_vpp_filter(fmt, out),
+            None => vaapi_filter(out),
+        };
+        let filtered = if odd_capture { format!("{EVEN_PAD},{base}") } else { base };
         return vec!["-vf".into(), filtered];
     }
     if odd_capture { return vec!["-vf".into(), EVEN_PAD.into()]; }
@@ -515,20 +535,42 @@ const AUTO_PROBE_BUDGET: Duration = Duration::from_secs(3);
 pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::ProbeOutcome {
     use crate::video_select::{ProbeFail, ProbeOutcome};
     let settings = VideoSettings { codec: VideoCodec::H264, ..Default::default() };
-    let mut command = ffmpeg_command();
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
-    command.args(["-f", "lavfi", "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1", "-an"]);
-    if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
-    command.args(encoder_options(&settings, encoder, "30", None));
-    command.args(["-f", "h264", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
-    let process = match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
-        Ok(Ok(output)) if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H264) => ProbeOutcome::Ok,
-        Ok(Ok(output)) if output.status.success() => ProbeOutcome::Fail(ProbeFail::NoIdr),
-        Ok(Ok(_)) => ProbeOutcome::Fail(ProbeFail::Exit),
-        Ok(Err(_)) => ProbeOutcome::Fail(ProbeFail::Spawn),
-        Err(_) => ProbeOutcome::Fail(ProbeFail::Timeout),
+    let run_once = |use_vpp: bool| {
+        let settings = settings;
+        async move {
+            let mut command = ffmpeg_command();
+            command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+            if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+            let src = if encoder == Encoder::Vaapi && use_vpp {
+                "color=c=black:s=256x256:r=1,format=bgra"
+            } else {
+                "color=c=black:s=256x256:r=1"
+            };
+            command.args(["-f", "lavfi", "-i", src, "-frames:v", "1", "-an"]);
+            if encoder == Encoder::Vaapi {
+                let vf = if use_vpp { vaapi_vpp_filter("bgra", None) } else { vaapi_filter(None) };
+                command.args(["-vf", &vf]);
+            }
+            command.args(encoder_options(&settings, encoder, "30", None));
+            command.args(["-f", "h264", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+            match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
+                Ok(Ok(output)) if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H264) => ProbeOutcome::Ok,
+                Ok(Ok(output)) if output.status.success() => ProbeOutcome::Fail(ProbeFail::NoIdr),
+                Ok(Ok(_)) => ProbeOutcome::Fail(ProbeFail::Exit),
+                Ok(Err(_)) => ProbeOutcome::Fail(ProbeFail::Spawn),
+                Err(_) => ProbeOutcome::Fail(ProbeFail::Timeout),
+            }
+        }
     };
+    let try_vpp = encoder == Encoder::Vaapi && vaapi_vpp_wanted();
+    let mut process = run_once(try_vpp).await;
+    if try_vpp && process != ProbeOutcome::Ok {
+        let fallback = run_once(false).await;
+        if fallback == ProbeOutcome::Ok {
+            VAAPI_VPP_FALLBACK.store(true, Ordering::Release);
+            process = fallback;
+        }
+    }
     // The native engine opens against a real X display, so a synthetic lavfi frame cannot
     // exercise it. When this build would try that engine first, a process-only failure must
     // not drop the candidate (NativeUnprobed → legacy auto for it).
@@ -537,6 +579,10 @@ pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::
 
 /// True when `read_encoder_with` would open the in-process engine for this candidate
 /// on the selected backend (X11 hardware encoders, or Portal VAAPI).
+pub(crate) fn native_would_open(encoder: Encoder) -> bool {
+    native_engine_would_run(encoder)
+}
+
 fn native_engine_would_run(encoder: Encoder) -> bool {
     native_engine_eligible(encoder, native_display_kind())
 }
@@ -623,17 +669,31 @@ async fn probe_hevc(spec: FfmpegSpec, requested: Encoder) -> bool {
     if requested != Encoder::Cpu { candidates.push(Encoder::Cpu); }
     for encoder in candidates {
         let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
-        let mut command = spec.command();
-        command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-        if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
-        command.args(["-f", "lavfi", "-i", "color=black:size=256x256:rate=1", "-frames:v", "1", "-an"]);
-        if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
-        command.args(encoder_options(&settings, encoder, "30", None));
-        command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
-        if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
-            if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
-                log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
-                return true;
+        let modes: &[bool] = if encoder == Encoder::Vaapi && vaapi_vpp_wanted() { &[true, false] } else { &[false] };
+        for &use_vpp in modes {
+            let mut command = spec.command();
+            command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+            if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+            let src = if encoder == Encoder::Vaapi && use_vpp {
+                "color=black:size=256x256:rate=1,format=bgra"
+            } else {
+                "color=black:size=256x256:rate=1"
+            };
+            command.args(["-f", "lavfi", "-i", src, "-frames:v", "1", "-an"]);
+            if encoder == Encoder::Vaapi {
+                let vf = if use_vpp { vaapi_vpp_filter("bgra", None) } else { vaapi_filter(None) };
+                command.args(["-vf", &vf]);
+            }
+            command.args(encoder_options(&settings, encoder, "30", None));
+            command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+                if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
+                    if !use_vpp && encoder == Encoder::Vaapi && vaapi_vpp_wanted() {
+                        VAAPI_VPP_FALLBACK.store(true, Ordering::Release);
+                    }
+                    log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
+                    return true;
+                }
             }
         }
     }
@@ -713,22 +773,32 @@ async fn read_encoder(
         settings.chroma = crate::capture_setting::CHROMA_420;
         log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
     }
-    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await; }
-    #[cfg_attr(not(feature = "inproc-av"), allow(unused_mut))]
-    let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection).await; }
+    let try_vpp = encoder == Encoder::Vaapi && vaapi_vpp_wanted();
+    #[allow(unused_mut)]
+    let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
     // A failed native session still leaves the matching FFmpeg hardware pipeline.
     #[cfg(feature = "inproc-av")]
     if let Err(error) = &result {
         if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
-            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+        }
+    }
+    // If GPU VPP RGB upload failed on this driver, fall back to software NV12 + hardware VAAPI
+    // before dropping all the way to CPU libx264/libx265.
+    if let Err(error) = &result {
+        if try_vpp && !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none() {
+            VAAPI_VPP_FALLBACK.store(true, Ordering::Release);
+            log::warn!("{} VPP filter unavailable; falling back to software NV12 upload: {}", encoder.name_for(settings.codec), error);
+            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
         }
     }
     match result {
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
-            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await
+            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection).await
         },
         Err(error)=>Err(error),
     }
@@ -808,7 +878,7 @@ fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
         Encoder::Nvenc => "UU_NVENC_BUFFER_MS",
     };
     let requested = std::env::var(env).ok();
-    let default = if encoder == Encoder::Nvenc { max_kbps.clamp(500, 8000) } else { (max_kbps / 8).clamp(100, 500) };
+    let default = if encoder == Encoder::Nvenc { max_kbps.clamp(500, 8000) } else { (max_kbps / 8).clamp(100, 2500) };
     buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or(default)
 }
 
@@ -834,10 +904,70 @@ fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
 }
 
+const PORTAL_SPARSE_TAIL: u64 = 2;
+const PORTAL_SPARSE_KEEPALIVE: Duration = Duration::from_millis(150);
+
+/// Decides when the Portal child-process loop writes a raw frame to FFmpeg's stdin.
+/// Every returned `true` acquires one permit and produces one output access unit (1:1).
+/// Two trailing frames after each changed frame push that frame past VAAPI `async_depth=1`
+/// and `au_offsets_for`'s next-AU delimiter (`aud.len() >= 2`) without waiting for keepalive;
+/// an `idr` (PLI/FIR) request advances through the remaining `-g` frames plus one delimiter
+/// frame so static loss recovers in <=0.5 s instead of 4.5 s.
+struct PortalSparseGate {
+    gop: u64,
+    enabled: bool,
+    has_frame: bool,
+    tail_frames: u64,
+    since_idr: u64,
+    last_write: Option<Instant>,
+}
+
+impl PortalSparseGate {
+    fn new(gop: u64, enabled: bool) -> Self {
+        Self { gop: gop.max(1), enabled, has_frame: false, tail_frames: 0, since_idr: 0, last_write: None }
+    }
+    fn should_write(&mut self, changed: bool, idr_requested: bool, now: Instant) -> bool {
+        if !self.enabled {
+            self.record_write(now);
+            return true;
+        }
+        if !self.has_frame || changed {
+            self.has_frame = true;
+            self.tail_frames = PORTAL_SPARSE_TAIL;
+            if idr_requested { self.arm_idr_after_this(); }
+            self.record_write(now);
+            return true;
+        }
+        if idr_requested {
+            self.arm_idr_after_this();
+            self.record_write(now);
+            return true;
+        }
+        if self.tail_frames > 0 {
+            self.tail_frames -= 1;
+            self.record_write(now);
+            return true;
+        }
+        if self.last_write.is_none_or(|at| now.saturating_duration_since(at) >= PORTAL_SPARSE_KEEPALIVE) {
+            self.record_write(now);
+            return true;
+        }
+        false
+    }
+    fn arm_idr_after_this(&mut self) {
+        let to_idr = (self.gop - (self.since_idr % self.gop)) % self.gop;
+        self.tail_frames = self.tail_frames.max(to_idr + 1);
+    }
+    fn record_write(&mut self, now: Instant) {
+        self.since_idr = (self.since_idr + 1) % self.gop;
+        self.last_write = Some(now);
+    }
+}
+
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,
-    #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool,sequence:Arc<std::sync::atomic::AtomicU64>,
-    settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool, vaapi_vpp: bool, sequence:Arc<std::sync::atomic::AtomicU64>,
+    settings: VideoSettings, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 )->Result<(),String>{
     let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
@@ -872,13 +1002,16 @@ async fn read_encoder_with(
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
     let fps = settings.effective_fps().to_string();
-    // Keep the IDR interval at 2 s whatever the frame rate.
-    let gop = gop_frames(settings.effective_fps(), false).to_string();
+    let gop_num = gop_frames(settings.effective_fps(), false);
+    let gop = gop_num.to_string();
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
-    let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
-    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.effective_fps(),cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
+    let input_rgb = if wayland { "bgra" } else { "bgr0" };
+    let rgb = nvenc_rgb_input(&settings, encoder, input_rgb);
+    let vpp_input = (encoder == Encoder::Vaapi && vaapi_vpp).then_some(input_rgb);
+    let logged_fmt = if vpp_input.is_some() { "vpp_nv12" } else if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) };
+    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.effective_fps(),cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),logged_fmt);
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
     let mut command = ffmpeg.command();
@@ -894,7 +1027,7 @@ async fn read_encoder_with(
             "-video_size",&size,"-i",&input,"-an"]);
     }
     // 其他分辨率: scale the captured desktop (the host display mode is left untouched).
-    command.args(scale_options(&settings, encoder, Some(source_size)));
+    command.args(scale_options_for(&settings, encoder, Some(source_size), vpp_input));
     command.args(encoder_options(&settings, encoder, &gop, rgb));
     // x11grab paces against an absolute schedule; after a capture stall it grabs
     // back-to-back to "catch up" (measured 69 frames in 200ms). vfr on a 1/FPS
@@ -951,6 +1084,8 @@ async fn read_encoder_with(
         })))
     } else if let Some(session)=portal {
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
+        let sparse_enabled = std::env::var("UU_PORTAL_SPARSE").as_deref() != Ok("0");
+        let portal_idr = idr.clone();
         Some(EncoderTask(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps()));
@@ -959,25 +1094,31 @@ async fn read_encoder_with(
             let (width,height)=session.size();
             let mut frame=vec![0;(width as usize)*(height as usize)*4];
             let mut version=None;
-            let (mut fresh,mut repeated)=(0u32,0u32);
+            let mut sparse=PortalSparseGate::new(gop_num, sparse_enabled);
+            let (mut fresh,mut repeated,mut encoded)=(0u32,0u32,0u32);
             let mut window=std::time::Instant::now();
             loop {
                 tick.tick().await;
-                let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
-                permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let session=session.clone();
                 let (next,next_version,changed)=tokio::task::spawn_blocking(move || {
                     let changed=session.capture_changed(&mut frame,&mut version)?;
                     Ok::<_,String>((frame,version,changed))
                 }).await.map_err(|e|format!("Portal capture worker: {e}"))??;
                 (frame,version)=(next,next_version);
-                sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
+                let idr_due = portal_idr.swap(false, Ordering::AcqRel);
+                let write = sparse.should_write(changed, idr_due, std::time::Instant::now());
+                if write {
+                    let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
+                    permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
+                    sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
+                    encoded+=1;
+                }
                 // Repeats are expected on a static desktop; a compositor that stopped painting
                 // (powered-off outputs) sends zero new frames while the stream still looks alive.
                 if changed { fresh+=1; } else { repeated+=1; }
                 if window.elapsed()>=Duration::from_secs(30) {
-                    log::info!("Portal frames: new={fresh} repeated={repeated} window_s={}",window.elapsed().as_secs());
-                    (fresh,repeated)=(0,0); window=std::time::Instant::now();
+                    log::info!("Portal frames: new={fresh} repeated={repeated} encoded={encoded} window_s={}",window.elapsed().as_secs());
+                    (fresh,repeated,encoded)=(0,0,0); window=std::time::Instant::now();
                 }
             }
         })))
@@ -1182,6 +1323,23 @@ fn keep_stream_display_awake() {
     if result.is_err() { log::warn!("Display wake failed; continuing desktop stream and retrying next interval"); }
 }
 
+fn encoder_changed(current: &VideoSettings, next: &VideoSettings) -> bool {
+    current.codec != next.codec
+        || current.source_id != next.source_id
+        || current.source_generation != next.source_generation
+        || current.output != next.output
+        || current.chroma != next.chroma
+        || current.effective_fps() != next.effective_fps()
+        || current.cq() != next.cq()
+        || current.max_kbps() != next.max_kbps()
+}
+
+fn needs_hard_discard(current: &VideoSettings, next: &VideoSettings) -> bool {
+    current.codec != next.codec
+        || current.source_id != next.source_id
+        || current.source_generation != next.source_generation
+}
+
 /// `sync_tx` receives a Message 25 payload when a live encoder switch changes the encoded chroma.
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
@@ -1286,8 +1444,8 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
             }
         }
         let next = *settings.borrow_and_update();
-        if next != current || send_interrupted {
-            let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
+        if encoder_changed(&current, &next) || send_interrupted {
+            let discard = needs_hard_discard(&current, &next) || send_interrupted;
             current = next;
             timeline.fps = u64::from(next.effective_fps());
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
@@ -1301,6 +1459,8 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 reader.restart(open(size, live_selection, next)).await;
             }
             send_interrupted=false;
+        } else {
+            current = next;
         }
         tokio::select! {
             result = &mut reader.0 => {
@@ -1374,7 +1534,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                         _ = health.tick() => { if transport_closed(&pc) { return Ok(()); } },
                         changed = settings.changed(), if settings_open => {
                             if changed.is_err() { settings_open=false; }
-                            else if *settings.borrow()!=current { send_interrupted=true; continue 'stream; }
+                            // Only source/codec switches abort an in-flight AU and drain queued frames;
+                            // bitrate/CQ/fps changes finish sending the current AU cleanly first.
+                            else if needs_hard_discard(&current, &*settings.borrow()) { send_interrupted=true; continue 'stream; }
                         },
                     }
                 }
@@ -1638,6 +1800,8 @@ mod tests {
         assert_eq!(buffer_kbits(300, Encoder::Nvenc), 500);
         assert_eq!(buffer_kbits(30_000, Encoder::Nvenc), 8000);
         assert_eq!(buffer_kbits(2000, Encoder::Vaapi), 250);
+        assert_eq!(buffer_kbits(8000, Encoder::Vaapi), 1000);
+        assert_eq!(buffer_kbits(20_000, Encoder::Vaapi), 2500);
         assert_eq!(buffer_kbits(2000, Encoder::Cpu), 2000);
         assert_eq!(buffer_kbits(300, Encoder::Cpu), 500);
         assert_eq!(buffer_kbits(30_000, Encoder::Cpu), 8000);
@@ -1661,11 +1825,63 @@ mod tests {
     fn vaapi_is_explicit_and_upload_follows_scale() {
         assert_eq!(vaapi_filter(None), "format=nv12,hwupload");
         assert_eq!(vaapi_filter(Some((1280,720))), "scale=1280:720:flags=bilinear,format=nv12,hwupload");
+        assert_eq!(vaapi_vpp_filter("bgra", None), "format=bgra,hwupload,scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv");
+        assert_eq!(vaapi_vpp_filter("bgr0", Some((1280,720))), "format=bgr0,hwupload,scale_vaapi=w=1280:h=720:format=nv12:out_color_matrix=bt709:out_range=tv");
+        let native = VideoSettings { output: None, ..Default::default() };
+        assert_eq!(scale_options_for(&native, Encoder::Vaapi, Some((2560, 2507)), Some("bgra")),
+            vec!["-vf".to_string(), "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black,format=bgra,hwupload,scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv".to_string()]);
         let options = vaapi_options(&VideoSettings::default(), "30");
         for pair in [["-g","30"], ["-bf","0"], ["-async_depth","1"], ["-aud","1"]] {
             assert!(options.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1]));
         }
         assert!(!options.iter().any(|v| v == "-r" || v == "-pix_fmt"));
+    }
+
+    #[test]
+    fn encoder_restart_predicates_ignore_shadowed_caps_and_preserve_inflight_soft_changes() {
+        let base = VideoSettings { quality: crate::capture_setting::QUALITY_HD, net_kbps: Some(10_000), ..Default::default() };
+        // `net_kbps` climbed above the 8M HD ceiling: `max_kbps()` stays 8000, so no restart is needed.
+        let shadowed = VideoSettings { net_kbps: Some(12_500), ..base };
+        assert_eq!(base.max_kbps(), shadowed.max_kbps());
+        assert!(!encoder_changed(&base, &shadowed));
+        // Real bitrate / quality / fps changes restart softly without hard-discarding queued frames.
+        let capped = VideoSettings { net_kbps: Some(4_000), ..base };
+        assert!(encoder_changed(&base, &capped));
+        assert!(!needs_hard_discard(&base, &capped));
+        // Codec or screen switches require an immediate discard.
+        let switched = VideoSettings { codec: VideoCodec::H265, ..base };
+        assert!(encoder_changed(&base, &switched));
+        assert!(needs_hard_discard(&base, &switched));
+    }
+
+    #[test]
+    fn portal_sparse_gate_flushes_tail_frames_and_advances_to_idr_on_pli() {
+        let mut gate = PortalSparseGate::new(30, true);
+        let t0 = Instant::now();
+        // Frame 0 (initial): written even if `changed == false`, arms 2 tail frames.
+        assert!(gate.should_write(false, false, t0));
+        assert!(gate.should_write(false, false, t0 + Duration::from_millis(16)));
+        assert!(gate.should_write(false, false, t0 + Duration::from_millis(32)));
+        // Tail exhausted: static ticks stay silent until keepalive (150 ms after last write at 32 ms -> 182 ms).
+        assert!(!gate.should_write(false, false, t0 + Duration::from_millis(48)));
+        assert!(!gate.should_write(false, false, t0 + Duration::from_millis(180)));
+        assert!(gate.should_write(false, false, t0 + Duration::from_millis(183)));
+        // We have written 4 frames (indices 0, 1, 2, 3 -> `since_idr == 4`).
+        // A PLI (`idr_requested == true`) on a static desktop must write through frame 30 (next IDR) + frame 31 (delimiter) = 28 writes total.
+        let mut pli_writes = 0;
+        let mut t = t0 + Duration::from_millis(200);
+        assert!(gate.should_write(false, true, t));
+        pli_writes += 1;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            if gate.should_write(false, false, t) {
+                pli_writes += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(pli_writes, 28, "must emit exact frames to reach next -g IDR plus 1 delimiter frame");
+        assert_eq!(gate.since_idr, 2, "frame 30 was IDR (0) and frame 31 flushed it (since_idr == 2)");
     }
 
     #[tokio::test]
@@ -1873,7 +2089,7 @@ mod tests {
             assert!(params.split(':').any(|value| value == option));
         }
         let vaapi = vaapi_options(&settings, "30");
-        for pair in [["-c:v", "hevc_vaapi"], ["-profile:v", "main"], ["-bf", "0"], ["-bufsize", "500k"]] {
+        for pair in [["-c:v", "hevc_vaapi"], ["-profile:v", "main"], ["-bf", "0"], ["-bufsize", "1000k"]] {
             assert!(vaapi.windows(2).any(|window| window == pair));
         }
         // hevc_vaapi with -aud drops every non-IRAP picture, so H.265 must not ask for AUDs.

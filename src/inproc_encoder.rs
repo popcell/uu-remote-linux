@@ -830,6 +830,59 @@ mod budget_tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires a VAAPI render node (EncSlice or Intel EncSliceLP) and FFmpeg"]
+    fn vaapi_multi_gop_and_on_demand_idr_decode_cleanly_in_both_codecs() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let device = CString::new(crate::video::vaapi_device()).unwrap();
+        let (w, h) = (1280u32, 720u32);
+        for (is_hevc, fmt) in [(0, "h264"), (1, "hevc")] {
+            let cfg = VaapiConfigFFI {
+                width: w, height: h, cap_width: w, cap_height: h, fps: 60, gop: 20,
+                target_bps: 4_000_000, max_bps: 6_000_000, buffer_bits: 1_000_000,
+                is_hevc, device: device.as_ptr(),
+            };
+            let engine = SafeVaapiEngine(unsafe { vaapi_create(&cfg) });
+            assert!(!engine.0.is_null(), "vaapi_create failed for {fmt}");
+            let mut stream = Vec::new();
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            let total_frames = 50u32;
+            for idx in 0..total_frames {
+                // Moving synthetic color bars across 2.5 GOPs + forced mid-GOP PLI IDR at frame 11.
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = ((y * w + x) * 4) as usize;
+                        pixels[off] = ((x + idx * 7) & 0xff) as u8;
+                        pixels[off + 1] = ((y + idx * 5) & 0xff) as u8;
+                        pixels[off + 2] = (((x ^ y) + idx * 3) & 0xff) as u8;
+                        pixels[off + 3] = 255;
+                    }
+                }
+                assert_eq!(unsafe { vaapi_upload_host_buffer(engine.0, pixels.as_ptr(), w * 4) }, 0);
+                let mut out_ptr = std::ptr::null();
+                let mut out_len = 0u32;
+                let force_idr = i32::from(idx == 11);
+                assert_eq!(unsafe { vaapi_encode_frame(engine.0, force_idr, &mut out_ptr, &mut out_len) }, 0, "encode failed at {idx} for {fmt}");
+                assert!(!out_ptr.is_null() && out_len > 0);
+                let packet = unsafe { std::slice::from_raw_parts(out_ptr, out_len as usize) };
+                stream.extend_from_slice(packet);
+            }
+            let mut decoder = Command::new("ffmpeg").args([
+                "-hide_banner", "-loglevel", "error", "-f", fmt, "-i", "pipe:0",
+                "-fps_mode", "passthrough", "-vf", "scale=2:2", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
+            ]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut stdin = decoder.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || stdin.write_all(&stream));
+            let out = decoder.wait_with_output().unwrap();
+            writer.join().unwrap().unwrap();
+            assert!(out.status.success() && out.stderr.is_empty(),
+                "{fmt} decode errors: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.stdout.len(), (total_frames as usize) * 2 * 2 * 3,
+                "{fmt} decoded frame count mismatch");
+        }
+    }
+
     #[tokio::test]
     async fn closing_encoder_output_wakes_a_blocked_capture() {
         let budget = Arc::new(Semaphore::new(0));

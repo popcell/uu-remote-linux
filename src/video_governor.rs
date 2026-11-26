@@ -33,6 +33,8 @@ pub const AUTO_CEILING_KBPS: u32 = 8_000;
 const DECREASE_AFTER: Duration = Duration::from_secs(3);
 /// Increases are slower than decreases, and a restart costs a keyframe.
 const INCREASE_AFTER: Duration = Duration::from_secs(4);
+/// Child-process restarts respawn FFmpeg and force an IDR, so climbs wait longer per step.
+pub const SUBPROCESS_INCREASE_AFTER: Duration = Duration::from_secs(8);
 const MIN_STEP_KBPS: u32 = 500;
 /// Recovery stops at 90% of the rate that broke the path; only a probe may go above it, this often.
 const PROBE_AFTER: Duration = Duration::from_secs(60);
@@ -81,9 +83,33 @@ pub struct Governor {
     loss_at: Option<Instant>,
     /// Lowest round trip seen this session: the propagation delay the knees are measured above.
     base_rtt_ms: Option<f64>,
+    /// Override for the upward step cooldown (e.g. external FFmpeg child-process pipeline).
+    increase_after: Option<Duration>,
+    /// True after a climb decision until the restarted encoder emits its first complete AU.
+    awaiting_first_au: bool,
 }
 
 impl Governor {
+    pub fn with_subprocess_climb(subprocess: bool) -> Self {
+        Self { increase_after: subprocess.then_some(SUBPROCESS_INCREASE_AFTER), ..Default::default() }
+    }
+
+    /// Hold further upward steps until the newly restarted encoder actually emits an AU.
+    /// Congestion cuts remain unblocked so a stalled or broken path still steps down immediately.
+    pub fn defer_climb_until_au(&mut self) {
+        self.awaiting_first_au = true;
+    }
+
+    /// Anchor the restart gate to when the new encoder tier's first complete AU went out.
+    pub fn note_first_au(&mut self, now: Instant) {
+        if self.awaiting_first_au {
+            self.awaiting_first_au = false;
+            if let Some(at) = &mut self.applied {
+                if now > *at { *at = now; }
+            }
+        }
+    }
+
     /// One RTCP receiver report: `loss_percent` is its fraction lost in percent, `ceiling_kbps`
     /// the viewer's ceiling, `current_fps`/`ceiling_fps` the running and viewer-nominal frame
     /// rates, `adapt` the frame-drop opt-in. Returns what the encoder must restart at.
@@ -94,6 +120,7 @@ impl Governor {
         // had (a 500k custom stream capped below the floor looked like an applied 800k cap,
         // and after a raise to 6M congestion found "current == floor" and never stepped down).
         let current = self.effective(ceiling_kbps);
+        let increase_after = self.increase_after.unwrap_or(INCREASE_AFTER);
         if let Some(rtt) = rtt_ms.filter(|rtt| rtt.is_finite() && *rtt > 0.0) {
             self.base_rtt_ms = Some(self.base_rtt_ms.map_or(rtt, |base| base.min(rtt)));
         }
@@ -119,6 +146,7 @@ impl Governor {
             if loss_percent >= CONGESTION_LOSS_PERCENT { self.loss_at = Some(now); }
             self.decreased_at = Some(now);
             if let Some(cap) = self.apply((current / 2).max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now) {
+                self.awaiting_first_au = false;
                 return Decision { cap: Some(cap), ..Default::default() };
             }
             // The bitrate cannot go lower: at the floor the choice is dropped frames or fewer
@@ -126,14 +154,15 @@ impl Governor {
             // relay delivers neither, just a queue that only a reconnect empties).
             if adapt.enabled && current <= FLOOR_KBPS {
                 if let Some(step) = self.step_fps(FPS_LADDER.iter().filter(|&&s| s < current_fps).max().copied(), DECREASE_AFTER, now) {
+                    self.awaiting_first_au = false;
                     return Decision { fps: Some(Some(step)), ..Default::default() };
                 }
             }
             return Decision::default();
         }
-        if clean {
+        if clean && !self.awaiting_first_au {
             if let Some(cap) = self.apply((current + (current / 4).max(MIN_STEP_KBPS)).min(aim.max(current)),
-                current, INCREASE_AFTER, now) {
+                current, increase_after, now) {
                 return Decision { cap: Some(cap), ..Default::default() };
             }
         }
@@ -148,12 +177,12 @@ impl Governor {
         // next congested report stepping back down; that, plus the window a fresh
         // congestion report restarts, is the anti-flap.
         let quiet = self.loss_at.map_or(true, |at| now.duration_since(at) >= PROBE_AFTER);
-        if adapt.enabled && self.fps.is_some() && quiet {
+        if adapt.enabled && self.fps.is_some() && quiet && !self.awaiting_first_au {
             if current_fps >= ceiling_fps { self.fps = None; return Decision { fps: Some(None), ..Default::default() }; }
             // The ladder descends, so the next step up is the *smallest* entry above the
             // current rate (a `find` would hit the 144 head and jump to the ceiling).
             let up = FPS_LADDER.iter().filter(|&&s| s > current_fps).min().map(|&s| s.min(ceiling_fps));
-            if let Some(step) = self.step_fps(up, INCREASE_AFTER, now) {
+            if let Some(step) = self.step_fps(up, increase_after, now) {
                 return Decision { fps: Some(Some(step)), ..Default::default() };
             }
         }
@@ -496,5 +525,25 @@ mod tests {
         assert_eq!(governor.cap, Some(2_160));
         assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + DECREASE_AFTER + PROBE_AFTER + Duration::from_secs(2)).cap,
             Some(2_400), "the full viewer ceiling is available again after 60 s");
+    }
+
+    #[test]
+    fn subprocess_climb_waits_for_first_au_and_uses_longer_step_gate() {
+        let mut governor = Governor::with_subprocess_climb(true);
+        let no_fps = FpsAdapt::default();
+        let start = Instant::now();
+        assert_eq!(governor.observe(20.0, Some(20.0), 8_000, 60, 60, &no_fps, start).cap, Some(4_000));
+        governor.defer_climb_until_au();
+        // Even past the 10s post-decrease recovery, no climb happens before the restarted encoder emits an AU.
+        let t_stalled = start + Duration::from_secs(12);
+        assert_eq!(governor.observe(0.0, Some(20.0), 8_000, 60, 60, &no_fps, t_stalled).cap, None);
+        // Once the first AU goes out at t=13s, `applied` anchors to 13s; 4s later is still inside the 8s gate.
+        let t_au = start + Duration::from_secs(13);
+        governor.note_first_au(t_au);
+        assert_eq!(governor.observe(0.0, Some(20.0), 8_000, 60, 60, &no_fps, t_au + Duration::from_secs(4)).cap, None);
+        assert_eq!(governor.observe(0.0, Some(20.0), 8_000, 60, 60, &no_fps, t_au + SUBPROCESS_INCREASE_AFTER).cap, Some(5_000));
+        // Congestion still cuts after DECREASE_AFTER even while awaiting the first AU of a climb.
+        governor.defer_climb_until_au();
+        assert_eq!(governor.observe(20.0, Some(20.0), 8_000, 60, 60, &no_fps, t_au + SUBPROCESS_INCREASE_AFTER + DECREASE_AFTER).cap, Some(2_500));
     }
 }

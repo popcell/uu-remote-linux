@@ -299,8 +299,10 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
     update_interruption(p);
     pthread_cond_broadcast(&p->changed);
     pthread_mutex_unlock(&p->lock);
-    fprintf(stderr, "Portal capture format: format=%u size=%ux%u dma_buf=%d dma_requested=%d modifier=%llu\n",
-        info.format, info.size.width, info.size.height, p->dma_format, p->dma_requested, (unsigned long long)info.modifier);
+    fprintf(stderr, "Portal capture format: format=%u size=%ux%u fps=%u/%u max_fps=%u/%u dma_buf=%d dma_requested=%d modifier=%llu\n",
+        info.format, info.size.width, info.size.height,
+        info.framerate.num, info.framerate.denom, info.max_framerate.num, info.max_framerate.denom,
+        p->dma_format, p->dma_requested, (unsigned long long)info.modifier);
     /* PipeWire DMA-BUF sharing: modifier formats require DMA buffers exclusively.
      * Keep a current and a pending frame; at least four buffers prevent producer starvation. */
     if (p->stream) {
@@ -435,8 +437,27 @@ static const struct pw_stream_events stream_events = {
     .remove_buffer = stream_remove_buffer
 };
 
+static uint32_t portal_max_fps(void) {
+    const char *env = getenv("UU_DISPLAY_FPS");
+    if (env && *env) {
+        char *end = NULL;
+        double hz = strtod(env, &end);
+        if (end != env && isfinite(hz) && hz >= 24.0) {
+            long rounded = (long)(hz + 0.5);
+            if (rounded < 24) rounded = 24;
+            if (rounded > 144) rounded = 144;
+            return (uint32_t)rounded;
+        }
+    }
+    return 144;
+}
+
 static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, const struct spa_pod **params, int dma) {
     unsigned count = 0;
+    uint32_t max_fps = portal_max_fps();
+    uint32_t def_fps = max_fps < 60 ? max_fps : 60;
+    const char *env_fps = getenv("UU_DISPLAY_FPS");
+    if (env_fps && *env_fps) def_fps = max_fps;
     /* Only advertise linear RGB: arbitrary tiling/compression cannot be inferred from an FD.
      * PipeWire page_dma_buf: put the modifier format before the shared-memory fallback. */
     for (int with_modifier = dma; with_modifier >= 0; with_modifier--) {
@@ -452,7 +473,7 @@ static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, 
         else spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size,
             SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(1920,1080), &SPA_RECTANGLE(1,1), &SPA_RECTANGLE(8192,8192)), 0);
         spa_pod_builder_add(b,
-            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(60,1)), 0);
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(def_fps,1), &SPA_FRACTION(0,1), &SPA_FRACTION(max_fps,1)), 0);
         if (with_modifier) {
             spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
             spa_pod_builder_long(b, 0); /* DRM_FORMAT_MOD_LINEAR */

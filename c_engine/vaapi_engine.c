@@ -10,6 +10,7 @@
 #include <va/va_drmcommon.h>
 #include <va/va_vpp.h>
 #include <va/va_enc_h264.h>
+#include <va/va_enc_hevc.h>
 
 // Runtime-loaded libva, like the NVENC engine's libcuda/libnvidia-encode: an inproc-av build
 // must not add a hard DT_NEEDED on libva for users who never touch VAAPI.
@@ -20,6 +21,7 @@ static struct {
     __typeof__(vaInitialize) *vaInitialize;
     __typeof__(vaTerminate) *vaTerminate;
     __typeof__(vaErrorStr) *vaErrorStr;
+    __typeof__(vaGetConfigAttributes) *vaGetConfigAttributes;
     __typeof__(vaCreateSurfaces) *vaCreateSurfaces;
     __typeof__(vaDestroySurfaces) *vaDestroySurfaces;
     __typeof__(vaCreateConfig) *vaCreateConfig;
@@ -37,6 +39,7 @@ static struct {
     __typeof__(vaRenderPicture) *vaRenderPicture;
     __typeof__(vaEndPicture) *vaEndPicture;
     __typeof__(vaSyncSurface) *vaSyncSurface;
+    __typeof__(vaSyncBuffer) *vaSyncBuffer;
 } RT;
 
 static int vaapi_load_runtime(void) {
@@ -56,6 +59,7 @@ static int vaapi_load_runtime(void) {
     VA_LOAD(vaInitialize);
     VA_LOAD(vaTerminate);
     VA_LOAD(vaErrorStr);
+    VA_LOAD(vaGetConfigAttributes);
     VA_LOAD(vaCreateSurfaces);
     VA_LOAD(vaDestroySurfaces);
     VA_LOAD(vaCreateConfig);
@@ -73,6 +77,7 @@ static int vaapi_load_runtime(void) {
     VA_LOAD(vaRenderPicture);
     VA_LOAD(vaEndPicture);
     VA_LOAD(vaSyncSurface);
+    *(void**)&RT.vaSyncBuffer = dlsym(RT.libva_drm, "vaSyncBuffer") ? dlsym(RT.libva_drm, "vaSyncBuffer") : dlsym(RT.libva, "vaSyncBuffer");
     #undef VA_LOAD
     return 0;
 }
@@ -98,6 +103,11 @@ struct VaapiEngine {
     // frame_num / POC bookkeeping since the last IDR; H264 state the driver does not derive itself
     uint32_t frame_num;
     uint32_t rc_mode;
+    VAProfile enc_profile;
+    int low_power;
+    int hevc_gpb;
+    uint32_t hevc_tu_depth_inter;
+    uint32_t hevc_tu_depth_intra;
 
     // DMA-BUF backing
     int dma_fd;
@@ -130,7 +140,9 @@ static int vaapi_make_vpp_buffer(VaapiEngine* engine) {
     memset(&vpp_param, 0, sizeof(vpp_param));
     vpp_param.surface = engine->in_rgb_surf;
     vpp_param.surface_region = &engine->src_rect;
+    vpp_param.surface_color_standard = VAProcColorStandardSRGB;
     vpp_param.output_region = &engine->dst_rect;
+    vpp_param.output_color_standard = VAProcColorStandardBT709;
     return RT.vaCreateBuffer(engine->va_dpy, engine->vpp_ctx, VAProcPipelineParameterBufferType,
                              sizeof(vpp_param), 1, &vpp_param, &engine->vpp_buf) == VA_STATUS_SUCCESS ? 0 : -1;
 }
@@ -220,34 +232,78 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
         return NULL;
     }
 
-    // 3. Setup H.264 / HEVC EncSlice
-    VAProfile profile = engine->is_hevc ? VAProfileHEVCMain : VAProfileH264Main;
-    VAConfigAttrib enc_attrib[3];
-    enc_attrib[0].type = VAConfigAttribRTFormat;
-    enc_attrib[0].value = VA_RT_FORMAT_YUV420;
-    enc_attrib[1].type = VAConfigAttribRateControl;
-    // The engine writes SPS, PPS and slice headers itself (see BitWriter)
-    enc_attrib[2].type = VAConfigAttribEncPackedHeaders;
-    enc_attrib[2].value = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE;
-    // VBR like the FFmpeg VAAPI pipeline (target + maxrate), then CBR, then CQP
-    enc_attrib[1].value = VA_RC_VBR;
-    engine->rc_mode = VA_RC_VBR;
-    st = RT.vaCreateConfig(engine->va_dpy, profile, VAEntrypointEncSlice, enc_attrib, 3, &engine->enc_cfg);
-    if (st != VA_STATUS_SUCCESS) {
-        enc_attrib[1].value = VA_RC_CBR;
-        engine->rc_mode = VA_RC_CBR;
-        st = RT.vaCreateConfig(engine->va_dpy, profile, VAEntrypointEncSlice, enc_attrib, 3, &engine->enc_cfg);
+    // 3. Setup H.264 / HEVC EncSlice or EncSliceLP (Intel Gen12+ VDENC exposes LP only)
+    VAProfile profiles[3];
+    int n_profiles = 0;
+    if (engine->is_hevc) {
+        profiles[n_profiles++] = VAProfileHEVCMain;
+    } else {
+        profiles[n_profiles++] = VAProfileH264Main;
+        profiles[n_profiles++] = VAProfileH264ConstrainedBaseline;
+        profiles[n_profiles++] = VAProfileH264High;
     }
-    if (st != VA_STATUS_SUCCESS) {
-        // Fallback to CQP if CBR unsupported
-        enc_attrib[1].value = VA_RC_CQP;
-        st = RT.vaCreateConfig(engine->va_dpy, profile, VAEntrypointEncSlice, enc_attrib, 3, &engine->enc_cfg);
-        if (st != VA_STATUS_SUCCESS) {
-            fprintf(stderr, "[vaapi] vaCreateConfig EncSlice failed: %s\n", RT.vaErrorStr(st));
-            vaapi_destroy(engine);
-            return NULL;
+    const VAEntrypoint entrypoints[2] = { VAEntrypointEncSlice, VAEntrypointEncSliceLP };
+    const uint32_t rc_modes[3] = { VA_RC_VBR, VA_RC_CBR, VA_RC_CQP };
+    const uint32_t need_packed = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE;
+    VAStatus last_st = VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+
+    for (int ep_i = 0; ep_i < 2 && engine->enc_cfg == VA_INVALID_ID; ep_i++) {
+        VAEntrypoint ep = entrypoints[ep_i];
+        for (int pr_i = 0; pr_i < n_profiles && engine->enc_cfg == VA_INVALID_ID; pr_i++) {
+            VAProfile profile = profiles[pr_i];
+            VAConfigAttrib query[5];
+            memset(query, 0, sizeof(query));
+            query[0].type = VAConfigAttribRTFormat;
+            query[1].type = VAConfigAttribRateControl;
+            query[2].type = VAConfigAttribEncPackedHeaders;
+            query[3].type = VAConfigAttribEncMaxRefFrames;
+            query[4].type = VAConfigAttribEncHEVCBlockSizes;
+            int n_query = engine->is_hevc ? 5 : 4;
+            st = RT.vaGetConfigAttributes(engine->va_dpy, profile, ep, query, n_query);
+            if (st != VA_STATUS_SUCCESS) { last_st = st; continue; }
+            if (query[0].value == VA_ATTRIB_NOT_SUPPORTED || !(query[0].value & VA_RT_FORMAT_YUV420)) continue;
+            if (query[1].value == VA_ATTRIB_NOT_SUPPORTED) continue;
+            if (query[2].value == VA_ATTRIB_NOT_SUPPORTED || (query[2].value & need_packed) != need_packed) continue;
+
+            for (int rc_i = 0; rc_i < 3; rc_i++) {
+                uint32_t rc = rc_modes[rc_i];
+                if (!(query[1].value & rc)) continue;
+                VAConfigAttrib enc_attrib[3];
+                enc_attrib[0].type = VAConfigAttribRTFormat;
+                enc_attrib[0].value = VA_RT_FORMAT_YUV420;
+                enc_attrib[1].type = VAConfigAttribRateControl;
+                enc_attrib[1].value = rc;
+                enc_attrib[2].type = VAConfigAttribEncPackedHeaders;
+                enc_attrib[2].value = need_packed;
+                st = RT.vaCreateConfig(engine->va_dpy, profile, ep, enc_attrib, 3, &engine->enc_cfg);
+                if (st == VA_STATUS_SUCCESS) {
+                    engine->rc_mode = rc;
+                    engine->enc_profile = profile;
+                    engine->low_power = (ep == VAEntrypointEncSliceLP);
+                    if (engine->is_hevc) {
+                        uint32_t l1 = (query[3].value == VA_ATTRIB_NOT_SUPPORTED) ? 0 : ((query[3].value >> 16) & 0xffff);
+                        // Intel iHD EncSliceLP VDENC has no P-slice mode and encodes low-delay frames as GPB B-slices (L0=L1=prev).
+                        engine->hevc_gpb = engine->low_power && l1 > 0;
+                        engine->hevc_tu_depth_inter = engine->low_power ? 2 : 4;
+                        engine->hevc_tu_depth_intra = engine->low_power ? 2 : 4;
+                        if (engine->low_power && query[4].value != VA_ATTRIB_NOT_SUPPORTED && query[4].value != 0) {
+                            VAConfigAttribValEncHEVCBlockSizes bs = { .value = query[4].value };
+                            if (bs.bits.max_max_transform_hierarchy_depth_inter > 0)
+                                engine->hevc_tu_depth_inter = bs.bits.max_max_transform_hierarchy_depth_inter;
+                            if (bs.bits.max_max_transform_hierarchy_depth_intra > 0)
+                                engine->hevc_tu_depth_intra = bs.bits.max_max_transform_hierarchy_depth_intra;
+                        }
+                    }
+                    break;
+                }
+                last_st = st;
+            }
         }
-        engine->rc_mode = VA_RC_CQP;
+    }
+    if (engine->enc_cfg == VA_INVALID_ID) {
+        fprintf(stderr, "[vaapi] vaCreateConfig EncSlice/EncSliceLP failed: %s\n", RT.vaErrorStr(last_st));
+        vaapi_destroy(engine);
+        return NULL;
     }
 
     st = RT.vaCreateContext(engine->va_dpy, engine->enc_cfg, engine->width, engine->height, VA_PROGRESSIVE, engine->recon_surfs, 2, &engine->enc_ctx);
@@ -462,6 +518,9 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     uint32_t mb_h = (engine->height + 15) / 16;
     uint32_t frame_num = is_idr ? 0 : engine->frame_num;
     uint32_t crop_right = (mb_w * 16 - engine->width) / 2, crop_bottom = (mb_h * 16 - engine->height) / 2;
+    int baseline = (engine->enc_profile == VAProfileH264ConstrainedBaseline);
+    int high = (engine->enc_profile == VAProfileH264High);
+    int cabac = !baseline;
     if (is_idr) {
         VAEncSequenceParameterBufferH264 seq_p;
         memset(&seq_p, 0, sizeof(seq_p));
@@ -484,22 +543,34 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncSequenceParameterBufferType, sizeof(seq_p), 1, &seq_p, &b->seq) != VA_STATUS_SUCCESS)
             return -1;
 
-        // SPS: Main, level 5.1, frame_num and POC lsb 4 bits (both wrap & 15 above), one reference
+        // SPS: profile matches negotiated VAProfile, level 5.1, frame_num and POC lsb 4 bits, one reference
         BitWriter sps = {0};
         bw_nal(&sps, 3, 7);
-        bw_put(&sps, 77, 8); bw_put(&sps, 0x40, 8); bw_put(&sps, 51, 8); // constraint_set1: Main
-        bw_ue(&sps, 0); bw_ue(&sps, 0); bw_ue(&sps, 0); bw_ue(&sps, 0); // sps id, log2_max_frame_num-4, poc type 0, log2_max_poc_lsb-4
+        bw_put(&sps, baseline ? 66 : high ? 100 : 77, 8);
+        bw_put(&sps, baseline ? 0xc0 : high ? 0x00 : 0x40, 8);
+        bw_put(&sps, 51, 8);
+        bw_ue(&sps, 0);                                                   // sps id
+        if (high) {
+            bw_ue(&sps, 1); bw_ue(&sps, 0); bw_ue(&sps, 0);               // chroma_format_idc 4:2:0, 8-bit
+            bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);                       // qpprime, seq_scaling_matrix
+        }
+        bw_ue(&sps, 0); bw_ue(&sps, 0); bw_ue(&sps, 0);                   // log2_max_frame_num-4, poc type 0, log2_max_poc_lsb-4
         bw_ue(&sps, 1); bw_put(&sps, 0, 1);                               // max_num_ref_frames, gaps
         bw_ue(&sps, mb_w - 1); bw_ue(&sps, mb_h - 1);
         bw_put(&sps, 1, 1); bw_put(&sps, 1, 1);                           // frame_mbs_only, direct_8x8_inference
         bw_put(&sps, seq_p.frame_cropping_flag, 1);
         if (seq_p.frame_cropping_flag) { bw_ue(&sps, 0); bw_ue(&sps, crop_right); bw_ue(&sps, 0); bw_ue(&sps, crop_bottom); }
-        bw_put(&sps, 0, 1);                                               // no VUI
+        // Minimal VUI: TV limited range + BT.709 so VideoToolbox matches VPP output_color_standard
+        bw_put(&sps, 1, 1);                                               // vui_parameters_present_flag
+        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);                           // aspect_ratio, overscan
+        bw_put(&sps, 1, 1); bw_put(&sps, 5, 3); bw_put(&sps, 0, 1);       // video_signal_type, unspecified, limited range
+        bw_put(&sps, 1, 1); bw_put(&sps, 1, 8); bw_put(&sps, 1, 8); bw_put(&sps, 1, 8); // BT.709 primaries/transfer/matrix
+        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);
         bw_trailing(&sps);
-        // PPS: CABAC, one L0 reference, QP 26, default deblocking
+        // PPS: CABAC (Main/High) or CAVLC (ConstrainedBaseline), one L0 reference, QP 26
         BitWriter pps = {0};
         bw_nal(&pps, 3, 8);
-        bw_ue(&pps, 0); bw_ue(&pps, 0); bw_put(&pps, 1, 1); bw_put(&pps, 0, 1);
+        bw_ue(&pps, 0); bw_ue(&pps, 0); bw_put(&pps, cabac, 1); bw_put(&pps, 0, 1);
         bw_ue(&pps, 0); bw_ue(&pps, 0); bw_ue(&pps, 0);                    // slice groups, num_ref_idx l0/l1 - 1
         bw_put(&pps, 0, 1); bw_put(&pps, 0, 2);                           // weighted pred / bipred
         bw_se(&pps, 0); bw_se(&pps, 0); bw_se(&pps, 0);                    // pic_init_qp-26, qs, chroma offset
@@ -530,7 +601,7 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     pic_p.pic_parameter_set_id = 0;
     pic_p.pic_fields.bits.idr_pic_flag = is_idr ? 1 : 0;
     pic_p.pic_fields.bits.reference_pic_flag = 1;
-    pic_p.pic_fields.bits.entropy_coding_mode_flag = 1;
+    pic_p.pic_fields.bits.entropy_coding_mode_flag = cabac;
     pic_p.pic_fields.bits.deblocking_filter_control_present_flag = 0;
     if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncPictureParameterBufferType, sizeof(pic_p), 1, &pic_p, &b->pic) != VA_STATUS_SUCCESS)
         return -1;
@@ -555,7 +626,7 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncSliceParameterBufferType, sizeof(slice_p), 1, &slice_p, &b->slice) != VA_STATUS_SUCCESS)
         return -1;
 
-    // Slice header including cabac_alignment_one_bit, byte aligned and escaped as FFmpeg submits it
+    // Slice header including cabac_alignment_one_bit (or CAVLC trailing), byte aligned and escaped as FFmpeg submits it
     BitWriter sh = {0};
     bw_nal(&sh, 3, is_idr ? 5 : 1);
     bw_ue(&sh, 0); bw_ue(&sh, is_idr ? 7 : 5); bw_ue(&sh, 0);           // first_mb, slice_type I/P (all slices), pps id
@@ -565,9 +636,10 @@ static int vaapi_h264_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     if (!is_idr) { bw_put(&sh, 0, 1); bw_put(&sh, 0, 1); }              // num_ref_idx override, ref list modification
     if (is_idr) { bw_put(&sh, 0, 1); bw_put(&sh, 0, 1); }               // no_output_of_prior_pics, long_term_reference
     else bw_put(&sh, 0, 1);                                             // adaptive_ref_pic_marking
-    if (!is_idr) bw_ue(&sh, 0);                                         // cabac_init_idc
+    if (cabac && !is_idr) bw_ue(&sh, 0);                                // cabac_init_idc
     bw_se(&sh, 0);                                                      // slice_qp_delta (no deblocking fields)
-    while (sh.bits % 8) bw_put(&sh, 1, 1);
+    if (cabac) { while (sh.bits % 8) bw_put(&sh, 1, 1); }
+    else bw_trailing(&sh);
     return vaapi_add_packed(engine, VAEncPackedHeaderSlice, &sh, 1, b->packed, &b->packed_n);
 }
 
@@ -583,15 +655,21 @@ static void bw_hevc_ptl(BitWriter* w, uint32_t level) {
     bw_put(w, level, 8);
 }
 
-// HEVC Main with FFmpeg's hevc_vaapi parameters on radeonsi (LIBVA_TRACE + trace_headers of its output):
+// HEVC Main on AMD radeonsi (EncSlice, P-slices) and Intel iHD Gen12+ (EncSliceLP VDENC, GPB B-slices):
 // 64x64 CTB, 8x8 min CB, 4x4..32x32 TB, AMP and SAO on, one short-term reference, POC lsb 12 bits.
-// FFmpeg also sends VA max_transform_hierarchy_depth 0 / diff_cu_qp_delta_depth 3 while its SPS/PPS
-// say 4 / 0; both copies are kept as FFmpeg has them, since that is what decodes on this driver.
+// On radeonsi EncSlice, FFmpeg sends VA max_transform_hierarchy_depth 0 / diff_cu_qp_delta_depth 3 while
+// SPS/PPS say 4 / 0. On Intel iHD EncSliceLP, VDENC honors TU depth 2/2, diff_cu_qp_delta_depth 3,
+// temporal MVP, and encodes non-IDR pictures as GPB low-delay B-slices (slice_type=0, L0=L1=prev_recon).
 static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_recon, VASurfaceID prev_recon, EncBuffers* b) {
     // pic size must be a multiple of the 8x8 min CB; the conformance window (in chroma units) crops the rest
     uint32_t w = (engine->width + 7) & ~7u, h = (engine->height + 7) & ~7u;
     uint32_t crop_right = (w - engine->width) / 2, crop_bottom = (h - engine->height) / 2;
     uint32_t poc = is_idr ? 0 : engine->since_idr;
+    int lp = engine->low_power;
+    int gpb = engine->hevc_gpb;
+    int tmvp = gpb ? 1 : 0;
+    uint32_t tu_inter = lp ? engine->hevc_tu_depth_inter : 4;
+    uint32_t tu_intra = lp ? engine->hevc_tu_depth_intra : 4;
     // Level from luma picture size and sample rate (Table A.8): 4.1, 5.0, 5.1, 5.2
     uint64_t size = (uint64_t)w * h, rate = size * engine->fps;
     uint32_t level = rate > 534773760 ? 156 : rate > 267386880 ? 153 : (size > 2228224 || rate > 133693440) ? 150 : 123;
@@ -609,8 +687,13 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         seq_p.seq_fields.bits.chroma_format_idc = 1;
         seq_p.seq_fields.bits.amp_enabled_flag = 1;
         seq_p.seq_fields.bits.sample_adaptive_offset_enabled_flag = 1;
+        seq_p.seq_fields.bits.sps_temporal_mvp_enabled_flag = tmvp;
         seq_p.log2_diff_max_min_luma_coding_block_size = 3;
         seq_p.log2_diff_max_min_transform_block_size = 3;
+        if (lp) {
+            seq_p.max_transform_hierarchy_depth_inter = tu_inter;
+            seq_p.max_transform_hierarchy_depth_intra = tu_intra;
+        }
         if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncSequenceParameterBufferType, sizeof(seq_p), 1, &seq_p, &b->seq) != VA_STATUS_SUCCESS)
             return -1;
 
@@ -635,11 +718,18 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         bw_ue(&sps, 0); bw_ue(&sps, 0); bw_ue(&sps, 8);                  // 8-bit luma/chroma, log2_max_poc_lsb-4
         bw_put(&sps, 0, 1); bw_ue(&sps, 1); bw_ue(&sps, 0); bw_ue(&sps, 0);
         bw_ue(&sps, 0); bw_ue(&sps, 3); bw_ue(&sps, 0); bw_ue(&sps, 3);  // CB 8..64, TB 4..32
-        bw_ue(&sps, 4); bw_ue(&sps, 4);                                  // max transform hierarchy depth inter/intra
+        bw_ue(&sps, tu_inter); bw_ue(&sps, tu_intra);                    // max transform hierarchy depth inter/intra
         bw_put(&sps, 0, 1); bw_put(&sps, 1, 1); bw_put(&sps, 1, 1); bw_put(&sps, 0, 1); // scaling list, AMP, SAO, PCM
         bw_ue(&sps, 0); bw_put(&sps, 0, 1);                              // RPS in slice headers, no long-term refs
-        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);                          // temporal MVP, strong intra smoothing
-        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);                          // no VUI, no extension
+        bw_put(&sps, tmvp, 1); bw_put(&sps, 0, 1);                       // temporal MVP, strong intra smoothing
+        // VUI: TV limited range + BT.709 so VideoToolbox matches VPP output_color_standard
+        bw_put(&sps, 1, 1);                                              // vui_parameters_present_flag
+        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);                          // aspect_ratio, overscan
+        bw_put(&sps, 1, 1); bw_put(&sps, 5, 3); bw_put(&sps, 0, 1);      // video_signal_type, unspecified, limited range
+        bw_put(&sps, 1, 1); bw_put(&sps, 1, 8); bw_put(&sps, 1, 8); bw_put(&sps, 1, 8); // BT.709 primaries/transfer/matrix
+        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);
+        bw_put(&sps, 0, 1); bw_put(&sps, 0, 1); bw_put(&sps, 0, 1);      // remaining VUI flags
+        bw_put(&sps, 0, 1);                                              // no sps extension
         bw_trailing(&sps);
 
         BitWriter pps = {0};
@@ -647,9 +737,9 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         bw_ue(&pps, 0); bw_ue(&pps, 0);
         bw_put(&pps, 0, 1); bw_put(&pps, 0, 1); bw_put(&pps, 0, 3);      // dependent slices, output flag, extra bits
         bw_put(&pps, 0, 1); bw_put(&pps, 0, 1);                          // sign data hiding, cabac init present
-        bw_ue(&pps, 0); bw_ue(&pps, 0); bw_se(&pps, 0);                  // num_ref_idx l0/l1 default-1, init_qp-26
+        bw_ue(&pps, 0); bw_ue(&pps, 0); bw_se(&pps, lp ? 4 : 0);         // num_ref_idx l0/l1 default-1, init_qp-26
         bw_put(&pps, 0, 1); bw_put(&pps, 1, 1); bw_put(&pps, 1, 1);      // constrained intra, transform skip, cu_qp_delta
-        bw_ue(&pps, 0); bw_se(&pps, 0); bw_se(&pps, 0);                  // diff_cu_qp_delta_depth, cb/cr offsets
+        bw_ue(&pps, lp ? 3 : 0); bw_se(&pps, 0); bw_se(&pps, 0);         // diff_cu_qp_delta_depth, cb/cr offsets
         bw_put(&pps, 0, 1); bw_put(&pps, 0, 1); bw_put(&pps, 0, 1);      // slice chroma offsets, weighted pred/bipred
         bw_put(&pps, 0, 1); bw_put(&pps, 0, 1); bw_put(&pps, 0, 1);      // transquant bypass, tiles, entropy sync
         bw_put(&pps, 1, 1); bw_put(&pps, 0, 1); bw_put(&pps, 0, 1);      // loop filter across slices, deblocking ctl, scaling
@@ -674,7 +764,7 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
         pic_p.reference_frames[0].flags = VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
     }
     pic_p.coded_buf = engine->coded_buf;
-    pic_p.collocated_ref_pic_index = 0xff;
+    pic_p.collocated_ref_pic_index = tmvp ? 0 : 0xff;
     pic_p.pic_init_qp = 30;
     pic_p.diff_cu_qp_delta_depth = 3;
     pic_p.nal_unit_type = is_idr ? 19 : 1;                            // IDR_W_RADL / TRAIL_R
@@ -687,15 +777,19 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     if (RT.vaCreateBuffer(engine->va_dpy, engine->enc_ctx, VAEncPictureParameterBufferType, sizeof(pic_p), 1, &pic_p, &b->pic) != VA_STATUS_SUCCESS)
         return -1;
 
+    uint32_t stype = is_idr ? 2 : (gpb ? 0 : 1);                      // I, GPB B (Intel LP), or P (AMD)
     VAEncSliceParameterBufferHEVC slice_p;
     memset(&slice_p, 0, sizeof(slice_p));
     slice_p.num_ctu_in_slice = ((w + 63) / 64) * ((h + 63) / 64);
-    slice_p.slice_type = is_idr ? 2 : 1;                              // I / P
+    slice_p.slice_type = stype;
     for (int i = 0; i < 15; i++) {
         slice_p.ref_pic_list0[i].picture_id = slice_p.ref_pic_list1[i].picture_id = VA_INVALID_ID;
         slice_p.ref_pic_list0[i].flags = slice_p.ref_pic_list1[i].flags = VA_PICTURE_HEVC_INVALID;
     }
-    if (!is_idr) slice_p.ref_pic_list0[0] = pic_p.reference_frames[0];
+    if (!is_idr) {
+        slice_p.ref_pic_list0[0] = pic_p.reference_frames[0];
+        if (gpb) slice_p.ref_pic_list1[0] = pic_p.reference_frames[0];
+    }
     slice_p.max_num_merge_cand = 5;
     slice_p.slice_fields.bits.last_slice_of_pic_flag = 1;
     slice_p.slice_fields.bits.slice_sao_luma_flag = 1;
@@ -708,14 +802,22 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, VASurfaceID curr_r
     bw_hevc_nal(&sh, pic_p.nal_unit_type);
     bw_put(&sh, 1, 1);                                                  // first slice segment
     if (is_idr) bw_put(&sh, 0, 1);                                      // no_output_of_prior_pics
-    bw_ue(&sh, 0); bw_ue(&sh, slice_p.slice_type);                      // pps id, slice type
+    bw_ue(&sh, 0); bw_ue(&sh, stype);                                   // pps id, slice type
     if (!is_idr) {
         bw_put(&sh, poc & 0xfff, 12);
         bw_put(&sh, 0, 1);                                              // RPS coded here: one previous picture
         bw_ue(&sh, 1); bw_ue(&sh, 0); bw_ue(&sh, 0); bw_put(&sh, 1, 1); // negative 1, positive 0, delta-1 0, used
+        if (tmvp) bw_put(&sh, 1, 1);                                    // slice_temporal_mvp_enabled_flag
     }
     bw_put(&sh, 1, 1); bw_put(&sh, 1, 1);                               // SAO luma, chroma
-    if (!is_idr) { bw_put(&sh, 0, 1); bw_ue(&sh, 0); }                  // num_ref_idx override, five_minus_max_merge
+    if (!is_idr) {
+        bw_put(&sh, 0, 1);                                              // num_ref_idx_active_override_flag
+        if (stype == 0) {
+            bw_put(&sh, 0, 1);                                          // mvd_l1_zero_flag
+            if (tmvp) bw_put(&sh, 1, 1);                                // collocated_from_l0_flag
+        }
+        bw_ue(&sh, 0);                                                  // five_minus_max_num_merge_cand
+    }
     bw_se(&sh, 0);                                                      // slice_qp_delta (the driver writes the real one)
     bw_put(&sh, 0, 1);                                                  // loop filter across slices
     bw_put(&sh, 1, 1);                                                  // byte_alignment()
@@ -795,7 +897,12 @@ int vaapi_encode_frame(
     if (st != VA_STATUS_SUCCESS) goto done;
     st = RT.vaEndPicture(engine->va_dpy, engine->enc_ctx);
     if (st != VA_STATUS_SUCCESS) goto done;
-    st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+    if (RT.vaSyncBuffer) {
+        st = RT.vaSyncBuffer(engine->va_dpy, engine->coded_buf, VA_TIMEOUT_INFINITE);
+        if (st == VA_STATUS_ERROR_UNIMPLEMENTED) st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+    } else {
+        st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+    }
     if (st != VA_STATUS_SUCCESS) goto done;
 
     // 4. Map Bitstream Output; an access unit may arrive as several linked segments

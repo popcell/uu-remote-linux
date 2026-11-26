@@ -662,12 +662,15 @@ impl WebRtcSession {
             .map_err(|e| format!("Add video track failed: {}", e))?;
         let idr_on_feedback = idr_request.clone();
         let governor_settings = video_settings.clone();
+        let governor_track = video_track.clone();
+        let subprocess_climb = !crate::video::native_would_open(video_selection.encoder);
         tokio::spawn(async move {
             let video_ssrc = sender.get_parameters().await.encodings.first().map_or(0, |e| e.ssrc);
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
-            let mut governor = crate::video_governor::Governor::default();
+            let mut governor = crate::video_governor::Governor::with_subprocess_climb(subprocess_climb);
+            let mut pending_apply_rev: Option<u64> = None;
             let fps_adapt = crate::video_governor::FpsAdapt {
                 enabled: std::env::var("UU_VIDEO_FPS_ADAPT").map(|v| v.trim() == "1").unwrap_or(false),
             };
@@ -697,7 +700,14 @@ impl WebRtcSession {
                             // or a swollen round trip is the only thing that lowers it.
                             let (ceiling,fps,nominal_fps)={let s=governor_settings.borrow();(s.ceiling_kbps(),s.effective_fps(),s.fps)};
                             let loss=f32::from(r.fraction_lost)*100./256.;
-                            let decision=governor.observe(loss,rtt,ceiling,fps,nominal_fps,&fps_adapt,std::time::Instant::now());
+                            let now_inst = std::time::Instant::now();
+                            if let Some(rev) = pending_apply_rev {
+                                if governor_track.revision() > rev {
+                                    governor.note_first_au(now_inst);
+                                    pending_apply_rev = None;
+                                }
+                            }
+                            let decision=governor.observe(loss,rtt,ceiling,fps,nominal_fps,&fps_adapt,now_inst);
                             if decision.cap.is_some()||decision.fps.is_some() {
                                 if let Some(cap)=decision.cap {
                                     log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
@@ -707,12 +717,25 @@ impl WebRtcSession {
                                     Some(None)=>log::info!("Video frame rate released back to the viewer's setting"),
                                     None=>{},
                                 }
+                                let rev_before = governor_track.revision();
+                                let mut effective_changed = false;
                                 // Restarts the encoder at the new values through the settings watch;
                                 // one write so a bitrate+frame step reopens the pipeline exactly once.
-                                governor_settings.send_modify(|value| {
-                                    if let Some(cap)=decision.cap { value.net_kbps=Some(cap); }
-                                    if let Some(fps)=decision.fps { value.net_fps=fps; }
+                                governor_settings.send_if_modified(|value| {
+                                    let prev_kbps = value.max_kbps();
+                                    let prev_fps = value.effective_fps();
+                                    let mut next = *value;
+                                    if let Some(cap)=decision.cap { next.net_kbps=Some(cap); }
+                                    if let Some(fps)=decision.fps { next.net_fps=fps; }
+                                    if next == *value { return false; }
+                                    effective_changed = next.max_kbps() != prev_kbps || next.effective_fps() != prev_fps;
+                                    *value = next;
+                                    true
                                 });
+                                if effective_changed {
+                                    pending_apply_rev = Some(rev_before);
+                                    governor.defer_climb_until_au();
+                                }
                             }
                         }
                         if log_now {
