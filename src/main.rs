@@ -754,7 +754,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
             let mut idle = 0u8;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                if sessions.lock().await.values().any(|s| s.role.is_desktop()) { idle = 0; continue; }
+                let sessions = sessions.lock().await;
+                if sessions.values().any(|s| s.role.is_desktop()) { idle = 0; continue; }
                 idle = idle.saturating_add(1);
                 if idle >= 2 { portal.end_idle(); }
             }

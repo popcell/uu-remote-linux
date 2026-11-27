@@ -88,6 +88,27 @@ impl ScreenCapture {
             display: "wayland:portal".into(), width, height,
             portal: Some(session), kms: None, buffer: Mutex::new(Vec::new()) })
     }
+    /// View of the same Portal session after a source switch changed its dimensions.
+    pub fn with_portal_size(&self, width: u32, height: u32) -> Self {
+        Self {
+            backend: self.backend,
+            init_error: self.init_error.clone(),
+            display: self.display.clone(),
+            width,
+            height,
+            portal: self.portal.clone(),
+            kms: None,
+            buffer: Mutex::new(Vec::new()),
+        }
+    }
+    /// Live capture dimensions: Portal sessions can switch between virtual and physical
+    /// outputs after a `ScreenCapture` snapshot was taken.
+    pub fn live_size(&self) -> (u32, u32) {
+        match self.portal.as_ref().map(|portal| portal.size()) {
+            Some((width, height)) if width > 0 && height > 0 => (width, height),
+            _ => (self.width, self.height),
+        }
+    }
     pub fn new() -> Result<Self, String> {
         let backend=crate::desktop_backend::detect()?;
         if backend == crate::desktop_backend::DesktopBackend::Kms {

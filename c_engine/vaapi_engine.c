@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
@@ -16,12 +17,13 @@
 // Runtime-loaded libva, like the NVENC engine's libcuda/libnvidia-encode: an inproc-av build
 // must not add a hard DT_NEEDED on libva for users who never touch VAAPI.
 // Signatures come from the installed headers via __typeof__ so they cannot drift.
-static struct {
+typedef struct {
     void *libva, *libva_drm;
     __typeof__(vaGetDisplayDRM) *vaGetDisplayDRM;
     __typeof__(vaInitialize) *vaInitialize;
     __typeof__(vaTerminate) *vaTerminate;
     __typeof__(vaErrorStr) *vaErrorStr;
+    __typeof__(vaQueryVendorString) *vaQueryVendorString;
     __typeof__(vaGetConfigAttributes) *vaGetConfigAttributes;
     __typeof__(vaCreateSurfaces) *vaCreateSurfaces;
     __typeof__(vaDestroySurfaces) *vaDestroySurfaces;
@@ -40,26 +42,42 @@ static struct {
     __typeof__(vaRenderPicture) *vaRenderPicture;
     __typeof__(vaEndPicture) *vaEndPicture;
     __typeof__(vaSyncSurface) *vaSyncSurface;
+    VAStatus (*vaSyncSurface2)(VADisplay, VASurfaceID, uint64_t);
     __typeof__(vaSyncBuffer) *vaSyncBuffer;
-} RT;
+} VaapiRuntime;
+
+static VaapiRuntime RT;
+static atomic_int rt_ready = 0;
+static pthread_mutex_t rt_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int vaapi_load_runtime(void) {
-    if (RT.libva) return 0;
-    RT.libva = dlopen("libva.so.2", RTLD_NOW | RTLD_GLOBAL);
-    RT.libva_drm = dlopen("libva-drm.so.2", RTLD_NOW);
-    if (!RT.libva || !RT.libva_drm) {
+    if (atomic_load_explicit(&rt_ready, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&rt_lock);
+    if (atomic_load_explicit(&rt_ready, memory_order_relaxed)) {
+        pthread_mutex_unlock(&rt_lock);
+        return 0;
+    }
+    VaapiRuntime tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.libva = dlopen("libva.so.2", RTLD_NOW | RTLD_GLOBAL);
+    tmp.libva_drm = dlopen("libva-drm.so.2", RTLD_NOW);
+    if (!tmp.libva || !tmp.libva_drm) {
         fprintf(stderr, "[vaapi] dlopen libva/libva-drm failed\n");
+        if (tmp.libva_drm) dlclose(tmp.libva_drm);
+        if (tmp.libva) dlclose(tmp.libva);
+        pthread_mutex_unlock(&rt_lock);
         return -1;
     }
     // libva-drm depends on libva, so one lookup covers both libraries
     #define VA_LOAD(sym) do { \
-        *(void**)&RT.sym = dlsym(RT.libva_drm, #sym) ? dlsym(RT.libva_drm, #sym) : dlsym(RT.libva, #sym); \
-        if (!RT.sym) { dlclose(RT.libva_drm); dlclose(RT.libva); RT.libva = RT.libva_drm = NULL; return -1; } \
+        *(void**)&tmp.sym = dlsym(tmp.libva_drm, #sym) ? dlsym(tmp.libva_drm, #sym) : dlsym(tmp.libva, #sym); \
+        if (!tmp.sym) { dlclose(tmp.libva_drm); dlclose(tmp.libva); pthread_mutex_unlock(&rt_lock); return -1; } \
     } while (0)
     VA_LOAD(vaGetDisplayDRM);
     VA_LOAD(vaInitialize);
     VA_LOAD(vaTerminate);
     VA_LOAD(vaErrorStr);
+    VA_LOAD(vaQueryVendorString);
     VA_LOAD(vaGetConfigAttributes);
     VA_LOAD(vaCreateSurfaces);
     VA_LOAD(vaDestroySurfaces);
@@ -78,8 +96,12 @@ static int vaapi_load_runtime(void) {
     VA_LOAD(vaRenderPicture);
     VA_LOAD(vaEndPicture);
     VA_LOAD(vaSyncSurface);
-    *(void**)&RT.vaSyncBuffer = dlsym(RT.libva_drm, "vaSyncBuffer") ? dlsym(RT.libva_drm, "vaSyncBuffer") : dlsym(RT.libva, "vaSyncBuffer");
+    *(void**)&tmp.vaSyncSurface2 = dlsym(tmp.libva_drm, "vaSyncSurface2") ? dlsym(tmp.libva_drm, "vaSyncSurface2") : dlsym(tmp.libva, "vaSyncSurface2");
+    *(void**)&tmp.vaSyncBuffer = dlsym(tmp.libva_drm, "vaSyncBuffer") ? dlsym(tmp.libva_drm, "vaSyncBuffer") : dlsym(tmp.libva, "vaSyncBuffer");
     #undef VA_LOAD
+    RT = tmp;
+    atomic_store_explicit(&rt_ready, 1, memory_order_release);
+    pthread_mutex_unlock(&rt_lock);
     return 0;
 }
 
@@ -97,8 +119,10 @@ struct VaapiEngine {
     int64_t buffer_bits;
     int is_hevc;
     uint32_t frame_count;
-    // frames since the last IDR (periodic GOP), the alternating idr_pic_id, and an IDR owed after a lost frame
+    // frames since the last IDR: since_idr gates periodic GOP (active frames only), while
+    // poc_since_idr counts every encoded picture for HEVC POC monotonicity.
     uint32_t since_idr;
+    uint32_t poc_since_idr;
     uint32_t idr_pic_id;
     int idr_pending;
     // frame_num / POC bookkeeping since the last IDR; H264 state the driver does not derive itself
@@ -112,6 +136,8 @@ struct VaapiEngine {
     int hevc_gpb;
     uint32_t hevc_tu_depth_inter;
     uint32_t hevc_tu_depth_intra;
+    int dmabuf_sync_ok;
+    int nv12_valid;
 
     // DMA-BUF backing
     int dma_fd;
@@ -169,7 +195,7 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
     engine->max_bps = config->max_bps > engine->target_bps ? config->max_bps : engine->target_bps;
     engine->buffer_bits = config->buffer_bits > 0 ? config->buffer_bits : engine->max_bps;
     engine->is_hevc = config->is_hevc;
-    engine->min_qp = 16;
+    engine->min_qp = config->cq > 0 ? config->cq : 16;
     engine->dma_fd = -1;
     // calloc leaves surface/context IDs at 0, which is a valid VA ID; mark them unset.
     engine->in_rgb_surf = VA_INVALID_ID;
@@ -235,6 +261,37 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
     if (st != VA_STATUS_SUCCESS) {
         vaapi_destroy(engine);
         return NULL;
+    }
+
+    // Verify bounded VPP completion on a real RGB->NV12 submission. Mesa Gallium's shader VPP path
+    // does not arm a vaSyncSurface fence on the output surface, so zero-copy external DMA-BUF is
+    // enabled only on Intel iHD drivers whose vaSyncSurface2 completes a real VPP job cleanly.
+    const char *vendor = RT.vaQueryVendorString(engine->va_dpy);
+    if (RT.vaSyncSurface2 && vendor && strncmp(vendor, "Intel iHD", 9) == 0) {
+        VASurfaceID probe_rgb = VA_INVALID_ID;
+        VABufferID probe_vpp = VA_INVALID_ID;
+        if (RT.vaCreateSurfaces(engine->va_dpy, VA_RT_FORMAT_RGB32, 64, 64, &probe_rgb, 1, NULL, 0) == VA_STATUS_SUCCESS) {
+            VARectangle probe_src = { .x = 0, .y = 0, .width = 64, .height = 64 };
+            VARectangle probe_dst = { .x = 0, .y = 0, .width = (uint16_t)(engine->width < 64 ? engine->width : 64),
+                                      .height = (uint16_t)(engine->height < 64 ? engine->height : 64) };
+            VAProcPipelineParameterBuffer probe_param;
+            memset(&probe_param, 0, sizeof(probe_param));
+            probe_param.surface = probe_rgb;
+            probe_param.surface_region = &probe_src;
+            probe_param.surface_color_standard = VAProcColorStandardSRGB;
+            probe_param.output_region = &probe_dst;
+            probe_param.output_color_standard = VAProcColorStandardBT709;
+            if (RT.vaCreateBuffer(engine->va_dpy, engine->vpp_ctx, VAProcPipelineParameterBufferType,
+                                  sizeof(probe_param), 1, &probe_param, &probe_vpp) == VA_STATUS_SUCCESS) {
+                VAStatus pst = RT.vaBeginPicture(engine->va_dpy, engine->vpp_ctx, engine->nv12_surf);
+                if (pst == VA_STATUS_SUCCESS) pst = RT.vaRenderPicture(engine->va_dpy, engine->vpp_ctx, &probe_vpp, 1);
+                if (pst == VA_STATUS_SUCCESS) pst = RT.vaEndPicture(engine->va_dpy, engine->vpp_ctx);
+                if (pst == VA_STATUS_SUCCESS) pst = RT.vaSyncSurface2(engine->va_dpy, engine->nv12_surf, 500ull * 1000 * 1000);
+                if (pst == VA_STATUS_SUCCESS) engine->dmabuf_sync_ok = 1;
+                RT.vaDestroyBuffer(engine->va_dpy, probe_vpp);
+            }
+            RT.vaDestroySurfaces(engine->va_dpy, &probe_rgb, 1);
+        }
     }
 
     // 3. Setup H.264 / HEVC EncSlice or EncSliceLP (Intel Gen12+ VDENC exposes LP only)
@@ -363,6 +420,7 @@ int vaapi_import_frame(VaapiEngine *engine, const UuDmaFrame *frame) {
         default: return -1;
     }
     vaapi_clear_input(engine);
+    engine->nv12_valid = 0;
     engine->dma_fd = frame->fd;
     engine->stride = frame->stride;
 
@@ -394,11 +452,13 @@ int vaapi_import_frame(VaapiEngine *engine, const UuDmaFrame *frame) {
     VAStatus st = RT.vaCreateSurfaces(engine->va_dpy, VA_RT_FORMAT_RGB32, engine->cap_width, engine->cap_height, &engine->in_rgb_surf, 1, attribs, 2);
     if (st != VA_STATUS_SUCCESS) {
         fprintf(stderr, "[vaapi] vaCreateSurfaces DRM_PRIME_2 failed: %s\n", RT.vaErrorStr(st));
+        engine->dma_fd = -1;
         return -1;
     }
 
     if (vaapi_make_vpp_buffer(engine) != 0) {
         fprintf(stderr, "[vaapi] vaCreateBuffer VPP failed\n");
+        vaapi_clear_input(engine);
         return -2;
     }
 
@@ -444,7 +504,16 @@ int vaapi_upload_host_buffer(VaapiEngine* engine, const uint8_t* host_ptr, uint3
     st = RT.vaPutImage(engine->va_dpy, engine->in_rgb_surf, engine->upload_img.image_id,
                        0, 0, engine->cap_width, engine->cap_height, 0, 0, engine->cap_width, engine->cap_height);
     if (st != VA_STATUS_SUCCESS) return -6;
+    engine->nv12_valid = 0;
     return 0;
+}
+
+int vaapi_supports_rate_control(const VaapiEngine* engine) {
+    return engine != NULL && engine->rc_mode != VA_RC_CQP;
+}
+
+int vaapi_supports_bounded_sync(const VaapiEngine* engine) {
+    return engine != NULL && engine->dmabuf_sync_ok;
 }
 
 // Sequence-level misc parameter. AMD's Mesa driver feeds the VCN ring message from these;
@@ -676,7 +745,7 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, int send_seq, VASu
     // pic size must be a multiple of the 8x8 min CB; the conformance window (in chroma units) crops the rest
     uint32_t w = (engine->width + 7) & ~7u, h = (engine->height + 7) & ~7u;
     uint32_t crop_right = (w - engine->width) / 2, crop_bottom = (h - engine->height) / 2;
-    uint32_t poc = is_idr ? 0 : engine->since_idr;
+    uint32_t poc = is_idr ? 0 : engine->poc_since_idr;
     int lp = engine->low_power;
     int gpb = engine->hevc_gpb;
     int tmvp = gpb ? 1 : 0;
@@ -839,32 +908,109 @@ static int vaapi_hevc_params(VaapiEngine* engine, int is_idr, int send_seq, VASu
     return vaapi_add_packed(engine, VAEncPackedHeaderSlice, &sh, 1, b->packed, &b->packed_n);
 }
 
-int vaapi_encode_frame(
+static VAStatus vaapi_sync_surface_bounded(VaapiEngine* engine, VASurfaceID surf, uint64_t timeout_ms, int allow_unbounded) {
+    if (RT.vaSyncSurface2) {
+        VAStatus st = RT.vaSyncSurface2(engine->va_dpy, surf, timeout_ms * 1000000ull);
+        if (st != VA_STATUS_ERROR_UNIMPLEMENTED) return st;
+    }
+    return allow_unbounded ? RT.vaSyncSurface(engine->va_dpy, surf) : VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+int vaapi_convert_input(VaapiEngine* engine, int release_input) {
+    if (!engine || engine->in_rgb_surf == VA_INVALID_ID || engine->vpp_buf == VA_INVALID_ID) return -1;
+    // Never submit VPP on an external PipeWire DMA-BUF unless verified bounded vaSyncSurface2 is available.
+    if (release_input && !engine->dmabuf_sync_ok) {
+        vaapi_clear_input(engine);
+        engine->nv12_valid = 0;
+        return -14;
+    }
+    // 1. Hardware VPP Color Conversion + scaling (RGB -> NV12 entirely inside VRAM)
+    VAStatus st = RT.vaBeginPicture(engine->va_dpy, engine->vpp_ctx, engine->nv12_surf);
+    if (st != VA_STATUS_SUCCESS) {
+        if (release_input) vaapi_clear_input(engine);
+        engine->nv12_valid = 0;
+        return -10;
+    }
+    st = RT.vaRenderPicture(engine->va_dpy, engine->vpp_ctx, &engine->vpp_buf, 1);
+    if (st != VA_STATUS_SUCCESS) {
+        if (release_input) vaapi_clear_input(engine);
+        engine->nv12_valid = 0;
+        return -10;
+    }
+    st = RT.vaEndPicture(engine->va_dpy, engine->vpp_ctx);
+    if (st != VA_STATUS_SUCCESS) {
+        engine->nv12_valid = 0;
+        if (!release_input) return -10;
+        // Intel iHD VPP can submit GPU command batches across passes before a later step fails
+        // inside vaEndPicture, without necessarily arming nv12_surf's fence. Never release an
+        // external PipeWire DMA-BUF back to the producer on vaEndPicture error; return -13 so
+        // the caller abandons the lease and disables DMA-BUF safely.
+        engine->idr_pending = 1;
+        return -13;
+    }
+
+    st = vaapi_sync_surface_bounded(engine, engine->nv12_surf, 500, !release_input);
+    if (st == VA_STATUS_SUCCESS) {
+        engine->nv12_valid = 1;
+        if (release_input) vaapi_clear_input(engine);
+        return 0;
+    }
+    engine->nv12_valid = 0;
+    if (!release_input) {
+        if (st == VA_STATUS_ERROR_TIMEDOUT) {
+            static atomic_uint vpp_timeouts;
+            if (atomic_fetch_add(&vpp_timeouts, 1) < 12) {
+                fprintf(stderr, "[vaapi] VPP completion timed out; dropping the pipeline\n");
+            }
+            engine->idr_pending = 1;
+            return -12;
+        }
+        return -10;
+    }
+    // External PipeWire DMA-BUF: VPP was submitted and did not complete within 500 ms.
+    // Destroying VA objects or closing the DRM fd does not cancel an in-flight GPU read, and
+    // sync errors (e.g. INVALID_SURFACE) do not prove completion. Drain up to 10 s for a real
+    // VA_STATUS_SUCCESS; only then may the buffer be released back to the producer (-12). Any
+    // other outcome returns -13 so the caller abandons the lease before tearing down the engine.
+    static atomic_uint vpp_timeouts;
+    if (atomic_fetch_add(&vpp_timeouts, 1) < 12) {
+        fprintf(stderr, "[vaapi] VPP completion failed/timed out on DMA-BUF (st=0x%x); dropping the pipeline\n", st);
+    }
+    engine->idr_pending = 1;
+    if (st == VA_STATUS_ERROR_TIMEDOUT) {
+        VAStatus drain = vaapi_sync_surface_bounded(engine, engine->nv12_surf, 10000, 0);
+        if (drain == VA_STATUS_SUCCESS) {
+            vaapi_clear_input(engine);
+            return -12;
+        }
+    }
+    return -13;
+}
+
+int vaapi_encode_nv12(
     VaapiEngine* engine,
     int force_idr,
+    int count_gop,
     const uint8_t** out_data,
     uint32_t* out_len
 ) {
     if (out_data) *out_data = NULL;
     if (out_len) *out_len = 0;
-    if (!engine || engine->in_rgb_surf == VA_INVALID_ID) return -1;
+    if (!engine || !engine->nv12_valid) return -1;
 
-    int is_idr = force_idr || engine->idr_pending || engine->frame_count == 0 || engine->since_idr >= engine->gop;
+    // HEVC SPS uses 12-bit POC LSB (MaxPicOrderCntLsb = 4096); force an IDR before wrap even on a
+    // static keepalive-only stream (~4 min at 17 fps) so POC stays strictly monotonic.
+    int is_idr = force_idr || engine->idr_pending || engine->frame_count == 0
+        || (count_gop && engine->since_idr >= engine->gop)
+        || (engine->is_hevc && engine->poc_since_idr >= 4095);
     // Recon ping-pong: a P frame must reference the previous recon surface, not its own
     VASurfaceID curr_recon = engine->recon_surfs[engine->frame_count & 1];
     VASurfaceID prev_recon = engine->recon_surfs[(engine->frame_count + 1) & 1];
 
-    // 1. Hardware VPP Color Conversion + scaling (RGB -> NV12 entirely inside VRAM)
-    VAStatus st = RT.vaBeginPicture(engine->va_dpy, engine->vpp_ctx, engine->nv12_surf);
-    if (st != VA_STATUS_SUCCESS) return -10;
-    st = RT.vaRenderPicture(engine->va_dpy, engine->vpp_ctx, &engine->vpp_buf, 1);
-    if (st != VA_STATUS_SUCCESS) return -10;
-    st = RT.vaEndPicture(engine->va_dpy, engine->vpp_ctx);
-    if (st != VA_STATUS_SUCCESS) return -10;
-
     // 2. Rate control and the codec's sequence / picture / slice parameters + packed headers
     EncBuffers b = { .seq = VA_INVALID_ID, .pic = VA_INVALID_ID, .slice = VA_INVALID_ID };
     int ret = -11;
+    uint32_t encoded_len = 0;
     // Rate control, the HRD size, the frame rate and the sequence's rate information are resubmitted
     // whenever they changed. The parameter sets themselves (SPS/PPS/VPS) still only ride an IDR.
     int send_rc = is_idr || engine->rc_dirty;
@@ -898,8 +1044,8 @@ int vaapi_encode_frame(
     }
     if ((engine->is_hevc ? vaapi_hevc_params : vaapi_h264_params)(engine, is_idr, send_rc, curr_recon, prev_recon, &b) != 0) goto done;
 
-    // 3. Render and Encode on AMD VCN hardware
-    VABufferID render_b[12];
+    // 3. Render and Encode on VAAPI hardware
+    VABufferID render_b[13];
     int render_n = 0;
     // FFmpeg's order: sequence, rate control misc, picture, packed headers (parameter sets, slice header), slice.
     // With misc first, radeonsi (Mesa 26) ignored the VBR target: the 1M preset ran at 1.6 Mbps, 0.96 after.
@@ -911,24 +1057,23 @@ int vaapi_encode_frame(
     for (int i = 0; i < b.packed_n; i++) render_b[render_n++] = b.packed[i];
     render_b[render_n++] = b.slice;
 
-    st = RT.vaBeginPicture(engine->va_dpy, engine->enc_ctx, engine->nv12_surf);
+    VAStatus st = RT.vaBeginPicture(engine->va_dpy, engine->enc_ctx, engine->nv12_surf);
     if (st != VA_STATUS_SUCCESS) goto done;
     st = RT.vaRenderPicture(engine->va_dpy, engine->enc_ctx, render_b, render_n);
     if (st != VA_STATUS_SUCCESS) goto done;
     st = RT.vaEndPicture(engine->va_dpy, engine->enc_ctx);
     if (st != VA_STATUS_SUCCESS) goto done;
     if (RT.vaSyncBuffer) {
-        // Bounded: an infinite wait on a wedged GPU freezes the stream (and, before the lease was
-        // released before encoding, input with it).
+        // Bounded: an infinite wait on a wedged GPU freezes the stream. Fallback syncs the
+        // encode render target passed to vaBeginPicture (nv12_surf), per libva core API docs.
         st = RT.vaSyncBuffer(engine->va_dpy, engine->coded_buf, 500ull * 1000 * 1000);
-        if (st == VA_STATUS_ERROR_UNIMPLEMENTED) st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+        if (st == VA_STATUS_ERROR_UNIMPLEMENTED) st = vaapi_sync_surface_bounded(engine, engine->nv12_surf, 500, 1);
     } else {
-        st = RT.vaSyncSurface(engine->va_dpy, curr_recon);
+        st = vaapi_sync_surface_bounded(engine, engine->nv12_surf, 500, 1);
     }
     if (st == VA_STATUS_ERROR_TIMEDOUT) {
         // A timed-out frame is still owned by the GPU: the coded buffer and the reconstruction
-        // surface must not be reused, and the caller must not release its DMA-BUF lease as if the
-        // copy had finished. Fail the picture hard so the pipeline is torn down and reopened.
+        // surface must not be reused. Fail the picture hard so the pipeline is torn down and reopened.
         static atomic_uint timeouts;
         if (atomic_fetch_add(&timeouts, 1) < 12) fprintf(stderr, "[vaapi] encode completion timed out; dropping the pipeline\n");
         ret = -12;
@@ -952,20 +1097,22 @@ int vaapi_encode_frame(
             memcpy(engine->output_staging + off, seg->buf, seg->size);
             off += seg->size;
         }
-        *out_data = engine->output_staging;
-        *out_len = total;
+        encoded_len = total;
+        if (out_data) *out_data = engine->output_staging;
+        if (out_len) *out_len = encoded_len;
     }
     RT.vaUnmapBuffer(engine->va_dpy, engine->coded_buf);
 
     engine->frame_num = is_idr ? 1 : ((engine->frame_num + 1) & 15);
-    engine->since_idr = is_idr ? 1 : engine->since_idr + 1;
+    engine->poc_since_idr = is_idr ? 1 : engine->poc_since_idr + 1;
+    engine->since_idr = is_idr ? 1 : (count_gop ? engine->since_idr + 1 : engine->since_idr);
     engine->frame_count++;
     engine->rc_dirty = 0;
     ret = 0;
 
 done:
     // No bitstream (failure, empty or slice overflow): the next frame_num / POC would skip, so restart with an IDR
-    engine->idr_pending = ret != 0 || *out_len == 0;
+    engine->idr_pending = ret != 0 || encoded_len == 0;
     for (int i = 0; i < b.misc_n; i++) {
         if (b.misc[i] != VA_INVALID_ID) RT.vaDestroyBuffer(engine->va_dpy, b.misc[i]);
     }
@@ -974,6 +1121,19 @@ done:
     if (b.slice != VA_INVALID_ID) RT.vaDestroyBuffer(engine->va_dpy, b.slice);
     for (int i = 0; i < b.packed_n; i++) RT.vaDestroyBuffer(engine->va_dpy, b.packed[i]);
     return ret;
+}
+
+int vaapi_encode_frame(
+    VaapiEngine* engine,
+    int force_idr,
+    const uint8_t** out_data,
+    uint32_t* out_len
+) {
+    if (out_data) *out_data = NULL;
+    if (out_len) *out_len = 0;
+    int conv = vaapi_convert_input(engine, 0);
+    if (conv != 0) return conv;
+    return vaapi_encode_nv12(engine, force_idr, 1, out_data, out_len);
 }
 
 /* A rate change takes effect with the next IDR, not on a P frame: iHD's VDENC derives its BRC

@@ -174,25 +174,36 @@ impl Governor {
             && self.settled(now);
         if loss_over || rtt_over {
             let cause = if loss_over { Cause::Loss } else { Cause::RoundTrip };
-            // Any congestion re-arms the bitrate probe: recovery must aim below the rate that
-            // caused the queue, RTT-only bufferbloat included. Only an actual loss burst,
-            // however, re-arms the frame-rate window: on a 0%-loss relay whose RTT oscillates
-            // 320-560 ms, refreshing it on every spike pinned frames at 5 fps for 13 minutes.
-            self.broken_at = Some((current, now));
-            if loss_over { self.loss_at = Some(now); }
-            self.decreased_at = Some(now);
             let target = if loss_over { current / 2 } else { current - current * RTT_DECREASE_PERCENT / 100 };
+            let draining_after_decrease = self.decreased_at.is_some_and(|at| now.duration_since(at) < DECREASE_AFTER);
+            // Fresh loss after a climb (not a draining report from a recent cut) must immediately
+            // reset the 60 s FPS quiet window even while the climb's restart gate holds the cut.
+            if loss_over && !draining_after_decrease {
+                self.loss_at = Some(now);
+            }
             if let Some(cap) = self.apply(target.max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now) {
+                // Record the rate that broke the path only when a decrease actually takes effect:
+                // draining reports that arrive during DECREASE_AFTER still carry the old queue and
+                // would otherwise overwrite broken_at with the already-lowered cap, pinning recovery
+                // there for the full 60 s probe window.
+                self.broken_at = Some((current, now));
+                if loss_over { self.loss_at = Some(now); }
+                self.decreased_at = Some(now);
                 self.awaiting_first_au = false;
                 return Decision { cap: Some(cap), fps: None, cause: Some(cause) };
             }
             // The bitrate cannot go lower: at the floor the choice is dropped frames or fewer
             // frames, and a slow-moving picture beats a frozen one (60 fps over a broken
             // relay delivers neither, just a queue that only a reconnect empties).
-            if adapt.enabled && current <= FLOOR_KBPS {
-                if let Some(step) = self.step_fps(FPS_LADDER.iter().filter(|&&s| s < current_fps).max().copied(), DECREASE_AFTER, now) {
-                    self.awaiting_first_au = false;
-                    return Decision { cap: None, fps: Some(Some(step)), cause: Some(cause) };
+            if current <= FLOOR_KBPS && self.applied.is_none_or(|at| now.duration_since(at) >= DECREASE_AFTER) {
+                self.broken_at = Some((current, now));
+                if loss_over { self.loss_at = Some(now); }
+                self.decreased_at = Some(now);
+                if adapt.enabled {
+                    if let Some(step) = self.step_fps(FPS_LADDER.iter().filter(|&&s| s < current_fps).max().copied(), DECREASE_AFTER, now) {
+                        self.awaiting_first_au = false;
+                        return Decision { cap: None, fps: Some(Some(step)), cause: Some(cause) };
+                    }
                 }
             }
             return Decision::default();
@@ -613,5 +624,52 @@ mod tests {
         // Congestion still cuts after DECREASE_AFTER even while awaiting the first AU of a climb.
         governor.defer_climb_until_au();
         assert_eq!(governor.observe(20.0, Some(20.0), 8_000, 60, 60, &no_fps, t_au + SUBPROCESS_INCREASE_AFTER + DECREASE_AFTER).cap, Some(2_500));
+    }
+
+    #[test]
+    fn draining_reports_after_decrease_do_not_pin_recovery_for_sixty_seconds() {
+        // Measured on a relay session: an RTT cut (8000 -> 6800) was followed by a draining report
+        // inside DECREASE_AFTER. Overwriting broken_at with 6800 set aim = 6120 <= 6800 and pinned
+        // the stream at 6800 for the entire 60 s probe window even after RTT returned to 25 ms.
+        let mut governor = Governor::default();
+        let no_fps = FpsAdapt::default();
+        let start = Instant::now();
+        governor.observe(0.0, Some(20.0), 8_000, 75, 75, &no_fps, start);
+        assert_eq!(governor.observe(0.0, Some(600.0), 8_000, 75, 75, &no_fps, start + Duration::from_secs(1)), Decision::default());
+        let cut = start + Duration::from_secs(1) + RTT_CONFIRM_AFTER;
+        assert_eq!(governor.observe(0.0, Some(600.0), 8_000, 75, 75, &no_fps, cut).cap, Some(6_800));
+        // Draining RTT report 1 s later (still inside DECREASE_AFTER): must not lower broken_at to 6800.
+        assert_eq!(governor.observe(0.0, Some(500.0), 8_000, 75, 75, &no_fps, cut + Duration::from_secs(1)), Decision::default());
+        // Once RECOVERY_AFTER_DECREASE passes on a clean path, recovery climbs to 90 % of 8000 (7200).
+        assert_eq!(governor.observe(0.0, Some(25.0), 8_000, 75, 75, &no_fps, cut + RECOVERY_AFTER_DECREASE).cap, Some(7_200));
+
+        // Same for a loss cut (8000 -> 4000): a second loss report inside DECREASE_AFTER must not
+        // overwrite broken_at with 4000 and pin the stream at half bitrate for 60 s.
+        let mut loss_gov = Governor::default();
+        assert_eq!(loss_gov.observe(15.0, Some(20.0), 8_000, 75, 75, &no_fps, start).cap, Some(4_000));
+        assert_eq!(loss_gov.observe(15.0, Some(20.0), 8_000, 75, 75, &no_fps, start + Duration::from_secs(1)), Decision::default());
+        assert_eq!(loss_gov.observe(0.0, Some(20.0), 8_000, 75, 75, &no_fps, start + RECOVERY_AFTER_DECREASE).cap, Some(5_000));
+    }
+
+    #[test]
+    fn loss_after_climb_inside_cooldown_resets_fps_probe_window() {
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        // Cut to floor, then drop FPS 60 -> 45 -> 30.
+        assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), start).cap, Some(FLOOR_KBPS));
+        let drop1 = start + DECREASE_AFTER;
+        assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), drop1).fps, Some(Some(45)));
+        let drop2 = drop1 + DECREASE_AFTER;
+        assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 45, 60, &adapt(), drop2).fps, Some(Some(30)));
+        // After PROBE_AFTER on a marginal path, FPS climbs 30 -> 45.
+        let climb = drop2 + PROBE_AFTER;
+        assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 30, 60, &adapt(), climb).fps, Some(Some(45)));
+        // 1 s after the climb (inside DECREASE_AFTER), real loss arrives: cut is rate-gated,
+        // yet loss_at MUST reset so FPS cannot climb again 4 s later without a fresh quiet window.
+        let fresh_loss = climb + Duration::from_secs(1);
+        assert_eq!(governor.observe(20.0, Some(200.0), 1_500, 45, 60, &adapt(), fresh_loss), Decision::default());
+        assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 45, 60, &adapt(), climb + INCREASE_AFTER), Decision::default(),
+            "fresh loss inside post-climb cooldown must restart the 60 s FPS quiet window");
+        assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 45, 60, &adapt(), fresh_loss + PROBE_AFTER).fps, Some(Some(60)));
     }
 }

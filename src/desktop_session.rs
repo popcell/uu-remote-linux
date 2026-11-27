@@ -113,6 +113,14 @@ fn should_prepare_power(healthy: bool, force_wake: bool) -> bool {
 /// enough: the PipeWire stream can be interrupted past its deadline, or the encoder's own reopen
 /// can be backing off, and neither comes with a lock event. Idle inhibition belongs to a working
 /// stream, so both read as unhealthy here.
+fn refresh_portal_size(screen: Arc<ScreenCapture>) -> Arc<ScreenCapture> {
+    let (width, height) = screen.live_size();
+    if screen.portal.is_some() && (screen.width, screen.height) != (width, height) {
+        return Arc::new(screen.with_portal_size(width, height));
+    }
+    screen
+}
+
 fn screen_capture_healthy(screen: &ScreenCapture) -> bool {
     screen.portal.as_ref().is_some_and(|portal| portal.capture_healthy())
 }
@@ -175,16 +183,27 @@ impl PortalDesktop {
     pub fn begin(&self) {
         // GNOME closes the Portal session on lock; a cached screen with a dead session
         // is not ready (no Allow, no stale video path) until maintain() rebuilds it.
-        self.state.send_modify(|state| state.waiting = state.screen.init_error.is_some()
-            || state.screen.portal.as_ref().is_some_and(|portal| !portal.is_alive()));
+        // Re-arm stream-loss recovery after a previous end_idle().
+        self.state.send_modify(|state| {
+            if let Some(portal) = state.screen.portal.as_ref() {
+                portal.begin();
+            }
+            state.screen = refresh_portal_size(state.screen.clone());
+            state.waiting = state.screen.init_error.is_some()
+                || state.screen.portal.as_ref().is_some_and(|portal| !portal.is_alive());
+        });
     }
     pub fn snapshot(&self) -> State { self.state.borrow().clone() }
-    /// No desktop controller left: stop sharing the screen. begin() then sees the dead
-    /// session and the next controller's maintain() reopens it with the saved consent.
+    /// No desktop controller left: stop sharing the screen and invalidate any in-flight or
+    /// queued recovery even when the previous compositor handle is already dead. begin() then
+    /// sees the dead session and the next controller's maintain() reopens it with saved consent.
     pub fn end_idle(&self) {
-        if let Some(portal) = self.snapshot().screen.portal.as_ref().filter(|portal| portal.is_alive()) {
+        if let Some(portal) = self.snapshot().screen.portal.as_ref() {
+            let was_alive = portal.is_alive();
             portal.end();
-            log::info!("Portal screen sharing ended: no desktop controller");
+            if was_alive {
+                log::info!("Portal screen sharing ended: no desktop controller");
+            }
         }
     }
     pub fn subscribe(&self) -> watch::Receiver<State> { self.state.subscribe() }
@@ -223,6 +242,7 @@ impl PortalDesktop {
     }
 
     fn publish(&self, owner: &DesktopInputSession, screen: Arc<ScreenCapture>) {
+        let screen = refresh_portal_size(screen);
         owner.with_current(|| {
             if screen.init_error.is_some() { owner.release_input(); }
             owner.bind_portal(screen.portal.clone());
@@ -267,7 +287,7 @@ impl PortalDesktop {
             |screen, cancel| {
                 if let Some(portal) = &screen.portal {
                     portal.recover(&cancel)?;
-                    Ok(screen)
+                    Ok(refresh_portal_size(screen))
                 } else {
                     ScreenCapture::open_portal(&cancel).map(Arc::new)
                 }
@@ -390,6 +410,12 @@ impl PortalDesktop {
         let screen = self.snapshot().screen;
         let healthy = health(screen.as_ref());
         if !should_prepare_power(healthy, force_wake) {
+            if healthy {
+                let refreshed = refresh_portal_size(screen.clone());
+                if !Arc::ptr_eq(&refreshed, &screen) {
+                    self.publish(owner, refreshed);
+                }
+            }
             return AttemptOutcome::Cancelled;
         }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -418,7 +444,7 @@ impl PortalDesktop {
         }
         // A new controller can arrive while the cached Portal handle is alive
         // but the display has gone to sleep without a lock transition.
-        if healthy { return AttemptOutcome::Ready(screen, inhibitor); }
+        if healthy { return AttemptOutcome::Ready(refresh_portal_size(screen), inhibitor); }
         // Marks every real reopen: paired with the lock-transition log, the absence of an
         // outcome after this line pins a stall to the blocking open/recovery worker below.
         log::info!("Portal attempt: reopening the capture session (force_wake={force_wake})");
@@ -999,5 +1025,117 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(releases.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "portal"))]
+    #[test]
+    fn end_idle_cancels_queued_recovery_even_when_handle_is_already_dead() {
+        use std::{sync::mpsc::channel, time::Duration};
+        let portal = Arc::new(crate::portal::PortalSession::test_dead());
+        assert!(!portal.is_alive(), "test handle must start already closed");
+        let mut screen = ScreenCapture::unavailable("synthetic".into());
+        screen.backend = crate::desktop_backend::DesktopBackend::Portal;
+        screen.init_error = None;
+        screen.width = 1920;
+        screen.height = 1080;
+        screen.portal = Some(portal.clone());
+        let (_lock, locked) = watch::channel(Some(false));
+        let desktop = PortalDesktop::with_lock_state(Arc::new(screen), locked);
+
+        let (entered, queued) = channel();
+        let (done_tx, done_rx) = channel();
+        std::thread::scope(|scope| {
+            let held = portal.test_lock_recovery();
+            let worker_portal = portal.clone();
+            let worker = scope.spawn(move || {
+                entered.send(()).unwrap();
+                let cancel = AtomicBool::new(false);
+                let _ = done_tx.send(worker_portal.recover(&cancel));
+            });
+            queued.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            // Real idle disconnect entry point: must cancel even though !portal.is_alive().
+            desktop.end_idle();
+            let outcome = done_rx.recv_timeout(Duration::from_secs(2))
+                .expect("end_idle must cancel a queued recovery on an already-dead handle");
+            assert_eq!(outcome.unwrap_err().code, 13);
+            drop(held);
+            worker.join().unwrap();
+        });
+        assert!(portal.test_ended());
+        // A recovery attempt entered AFTER end_idle() must also be rejected until begin().
+        assert_eq!(portal.recover(&AtomicBool::new(false)).unwrap_err().code, 13);
+        desktop.begin();
+        assert!(!portal.test_ended(), "next controller begin() must re-arm recovery");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "portal"))]
+    #[tokio::test]
+    async fn healthy_portal_publishes_updated_physical_size_after_privacy_exit() {
+        use std::time::Duration;
+        // Reconnect won `recovery` before `set_virtual(false)` ran, so the snapshot initially
+        // carries the virtual screen size (1920x1080).
+        let portal = Arc::new(crate::portal::PortalSession::test_dead());
+        let mut screen = ScreenCapture::unavailable("synthetic".into());
+        screen.backend = crate::desktop_backend::DesktopBackend::Portal;
+        screen.init_error = None;
+        screen.width = 1920;
+        screen.height = 1080;
+        screen.portal = Some(portal.clone());
+        let stale = Arc::new(screen);
+        let (_lock, locked) = watch::channel(Some(false));
+        let desktop = Arc::new(PortalDesktop::with_lock_state(stale.clone(), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        desktop.publish(&owner, stale.clone());
+        assert_eq!((desktop.snapshot().screen.width, desktop.snapshot().screen.height), (1920, 1080));
+
+        // `set_virtual(false)` then replaces the live handle with the physical display (3072x1920).
+        portal.test_set_size(3072, 1920);
+        // CONTROL init (`ScreenSources` / `CodecNegotiation`) reading even the pre-refresh snapshot
+        // must immediately see the live physical size.
+        assert_eq!(stale.live_size(), (3072, 1920));
+
+        // Steady-state healthy supervisor path (`force_wake` true on first tick, then false) must
+        // publish the updated physical size without reopening the healthy session.
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opens_worker = opens.clone();
+        let task = tokio::spawn({
+            let desktop = desktop.clone();
+            let owner = owner.clone();
+            async move {
+                desktop.maintain_with(
+                    owner,
+                    || Ok(()),
+                    || IdleGuard::default(),
+                    |_screen| true,
+                    move |screen, _cancel| {
+                        opens_worker.fetch_add(1, Ordering::Relaxed);
+                        Ok(screen)
+                    },
+                ).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while (desktop.snapshot().screen.width, desktop.snapshot().screen.height) != (3072, 1920) {
+            assert!(tokio::time::Instant::now() < deadline, "healthy supervisor never published physical size");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A later size update while already steady-state (`force_wake == false`) also converges.
+        portal.test_set_size(2560, 1440);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while (desktop.snapshot().screen.width, desktop.snapshot().screen.height) != (2560, 1440) {
+            assert!(tokio::time::Instant::now() < deadline, "steady-state healthy tick never published updated size");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(opens.load(Ordering::Relaxed), 0, "healthy path must not reopen the session");
+
+        // A subsequent controller's `begin()` also refreshes a stale cached snapshot immediately.
+        desktop.publish_test_screen(stale);
+        assert_eq!((desktop.snapshot().screen.width, desktop.snapshot().screen.height), (1920, 1080));
+        desktop.begin();
+        assert_eq!((desktop.snapshot().screen.width, desktop.snapshot().screen.height), (2560, 1440));
     }
 }

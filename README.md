@@ -283,7 +283,8 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 服务端可选的 `--features inproc-av` 是 X11 下的进程内硬件编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
 
 GNOME/KDE Wayland 的进程内编码用 `cargo build --release --features wayland,portal,inproc-av` 配合 `set-encoder vaapi` 启用，目前仅支持 Portal + VAAPI。
-`UU_PORTAL_DMABUF=0` 禁用 DMA-BUF、改用进程内上传；`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
+外部 PipeWire DMA-BUF 零拷贝仅在支持 `vaSyncSurface2` 且通过真实 VPP 完成探测的 Intel iHD 驱动上启用（若使用 `--features engine-plugins` 动态加载插件，还需配套导出 DMA-BUF 租约丢弃接口的新版 `libuu-portal.so`；静态编入的 `wayland,portal,inproc-av` 构建已自带）；其他 VAAPI 驱动（如 Mesa Gallium）或旧版插件会自动回落到 SHM 进程内上传并继续走 VAAPI 硬件编码，仅支持 CQP 码控的 VAAPI 驱动会自动回落到支持码率上限的编码管线。
+`UU_PORTAL_DMABUF=0` 强制禁用 DMA-BUF、改用进程内上传；`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
 
 ### 3. 登录
 

@@ -77,6 +77,7 @@ struct uu_portal {
     int dma_requested, dma_negotiated, dma_format, dma_bad, dma_blocked, dma_neutral, dma_seen;
     uint64_t modifier;
     gint64 dma_requested_at;
+    gint64 shm_wait_since;
     struct pw_buffer *dma_pending, *dma_current;
 };
 #include "portal_clipboard.inc"
@@ -370,6 +371,7 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
             for (size_t pixel = 0; pixel < p->frame_length / 4; pixel++) p->frame[pixel * 4 + 3] = 255;
             p->sequence++;
             p->revision++;
+            p->shm_wait_since = 0;
             return;
         }
         struct spa_meta_region *crop = spa_buffer_find_meta_data(spa, SPA_META_VideoCrop, sizeof(*crop));
@@ -392,6 +394,7 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
             }
             p->sequence++;
             p->revision++;
+            p->shm_wait_since = 0;
         }
     }
 }
@@ -499,7 +502,8 @@ int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *r
     pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
     int result = 10;
-    if (atomic_load(&p->closed) || p->error || p->dma_blocked) result = 14;
+    if (atomic_load(&p->closed) || p->error) result = 9;
+    else if (p->dma_blocked) result = 14;
     else if (p->dma_bad) result = p->dma_bad;
     else if (!p->dma_requested) {
         p->dma_requested = 1; p->dma_negotiated = 0; p->dma_seen = 0;
@@ -534,6 +538,33 @@ int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *r
 void uu_portal_dmabuf_release(struct uu_portal *p) {
     pw_thread_loop_unlock(p->pw_loop);
 }
+/* Release a DMA-BUF lease without returning the current buffer to the producer: used only when
+ * the GPU read never signaled completion or cancellation. Drops dma_current without calling
+ * pw_stream_queue_buffer, blocks further DMA-BUF use, and renegotiates SHM so the compositor
+ * tears down the DMA-BUF pool instead of reusing that buffer for a new frame. */
+void uu_portal_dmabuf_abandon(struct uu_portal *p) {
+    if (!p || !p->pw_loop) return;
+    pthread_mutex_lock(&p->lock);
+    p->dma_requested = 0;
+    p->dma_blocked = 1;
+    p->dma_neutral = 0;
+    return_dma_buffer(p, &p->dma_pending);
+    p->dma_current = NULL;
+    if (p->dma_format) {
+        p->sequence = 0;
+        p->revision++;
+        p->shm_wait_since = g_get_monotonic_time();
+    }
+    pthread_mutex_unlock(&p->lock);
+    int status = p->stream ? request_capture_formats(p, 0) : -1;
+    if (status < 0) {
+        pthread_mutex_lock(&p->lock);
+        p->error = 9;
+        pthread_cond_broadcast(&p->changed);
+        pthread_mutex_unlock(&p->lock);
+    }
+    pw_thread_loop_unlock(p->pw_loop);
+}
 void uu_portal_dmabuf_disable(struct uu_portal *p) {
     if (!p || !p->pw_loop || !p->stream) return;
     pw_thread_loop_lock(p->pw_loop);
@@ -542,10 +573,19 @@ void uu_portal_dmabuf_disable(struct uu_portal *p) {
     if (requested) {
         p->dma_requested = 0; p->dma_blocked = 1; p->dma_neutral = 0;
         return_dma_buffer(p, &p->dma_pending); return_dma_buffer(p, &p->dma_current);
-        if (p->dma_format) { p->sequence = 0; p->revision++; }
+        if (p->dma_format) {
+            p->sequence = 0;
+            p->revision++;
+            p->shm_wait_since = g_get_monotonic_time();
+        }
     }
     pthread_mutex_unlock(&p->lock);
-    if (requested) request_capture_formats(p, 0);
+    if (requested && request_capture_formats(p, 0) < 0) {
+        pthread_mutex_lock(&p->lock);
+        p->error = 9;
+        pthread_cond_broadcast(&p->changed);
+        pthread_mutex_unlock(&p->lock);
+    }
     pw_thread_loop_unlock(p->pw_loop);
 }
 static int connect_pipewire(struct uu_portal *p) {
@@ -870,8 +910,9 @@ int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
  * paused, format-less renegotiation observed after a live scaling change (#25).
  * Called with the frame mutex held; recovery runs on the Rust capture worker. */
 static int stream_stalled(struct uu_portal *p) {
-    if (p->state != PW_STREAM_STATE_PAUSED || p->format_valid || !p->interrupted_at) return 0;
     gint64 now = g_get_monotonic_time();
+    if (p->shm_wait_since && now - p->shm_wait_since >= PORTAL_RENEGOTIATION_TIMEOUT) return 1;
+    if (p->state != PW_STREAM_STATE_PAUSED || p->format_valid || !p->interrupted_at) return 0;
     return now - p->interrupted_at >= PORTAL_RENEGOTIATION_TIMEOUT ||
         (p->display_changed_at && p->display_changed_at >= p->interrupted_at - PORTAL_DISPLAY_GRACE &&
          now - MAX(p->interrupted_at, p->display_changed_at) >= PORTAL_DISPLAY_GRACE);

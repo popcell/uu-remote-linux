@@ -307,7 +307,8 @@ The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config -
 The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
 On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
-`UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
+External PipeWire DMA-BUF zero-copy is enabled only on Intel iHD drivers whose `vaSyncSurface2` passes the bounded VPP completion probe (when using `--features engine-plugins`, this also requires a matching `libuu-portal.so` that exports DMA-BUF lease abandonment; statically linked `wayland,portal,inproc-av` builds include it directly). Other VAAPI drivers (such as Mesa Gallium) or older plugins automatically fall back to SHM host upload into hardware VAAPI encoding, and CQP-only VAAPI drivers fall back to a rate-controlled pipeline.
+`UU_PORTAL_DMABUF=0` forces DMA-BUF off in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
 
 ### 3. Log in
 

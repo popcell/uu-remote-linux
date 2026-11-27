@@ -789,3 +789,194 @@ async fn terminal_notifications_and_disconnect_preserve_control_channel() {
         viewer.router.lock().await.stop().await.unwrap();
     }).await.expect("terminal lifecycle regression exceeded deadline");
 }
+
+#[tokio::test]
+async fn portal_geometry_switch_after_initial_control_init_republishes_sources_and_codec() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        // Reconnect starts ready on the 1920x1080 virtual privacy screen before `set_virtual(false)`
+        // finishes switching back to the 3072x1920 physical display.
+        let mut initial = ScreenCapture::unavailable("synthetic virtual desktop".into());
+        initial.backend = crate::desktop_backend::DesktopBackend::Portal;
+        initial.init_error = None;
+        initial.display = "wayland:portal".into();
+        initial.width = 1920;
+        initial.height = 1080;
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        let portal_session = Arc::new(crate::portal::PortalSession::test_dead());
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        {
+            initial.portal = Some(portal_session.clone());
+        }
+        let initial = Arc::new(initial);
+        let (_, locked) = tokio::sync::watch::channel(Some(false));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(initial.clone(), locked));
+        let (host, mut viewer) = connect(true, Some(portal.clone())).await;
+
+        let codec_size = |message: &[u8]| -> Option<(u64, u64)> {
+            let neg = body(message, 18)?;
+            let cap = body(neg, 1)?;
+            Some((varint_of(cap, 4)?, varint_of(cap, 5)?))
+        };
+        let source_size = |message: &[u8]| -> Option<(u64, u64)> {
+            let sources = body(message, 7)?;
+            let display = body(sources, 1)?;
+            let rect = body(display, 6)?;
+            Some((varint_of(rect, 3)?, varint_of(rect, 4)?))
+        };
+
+        // Initial CONTROL setup advertises the virtual screen geometry (1920x1080).
+        let init_codec = receive(&mut viewer.messages, 18, Duration::from_secs(5)).await
+            .expect("initial CodecNegotiation");
+        assert_eq!(codec_size(&init_codec), Some((1920, 1080)));
+        let init_sources = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await
+            .expect("initial ScreenSources");
+        assert_eq!(source_size(&init_sources), Some((1920, 1080)));
+
+        // Privacy exit switches back to the physical display (3072x1920). Even without a
+        // subsequent viewer capture-setting request (or waiting for a new publish on Portal
+        // builds), CONTROL must re-publish both messages with the physical geometry.
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        portal_session.test_set_size(3072, 1920);
+        #[cfg(not(all(target_os = "linux", feature = "portal")))]
+        portal.publish_test_screen(Arc::new(initial.with_portal_size(3072, 1920)));
+
+        let updated_codec = receive(&mut viewer.messages, 18, Duration::from_secs(5)).await
+            .expect("updated CodecNegotiation after physical switch");
+        assert_eq!(codec_size(&updated_codec), Some((3072, 1920)));
+        let updated_sources = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await
+            .expect("updated ScreenSources after physical switch");
+        assert_eq!(source_size(&updated_sources), Some((3072, 1920)));
+
+        // Publishing the refreshed PortalDesktop snapshot afterwards must not re-send duplicates.
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        portal.publish_test_screen(Arc::new(initial.with_portal_size(3072, 1920)));
+        assert!(receive(&mut viewer.messages, 7, Duration::from_millis(400)).await.is_none(),
+            "ScreenSources was re-sent without a further geometry change");
+
+        viewer.pc.close().await.unwrap();
+        host.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("portal geometry republish regression exceeded deadline");
+}
+
+#[tokio::test]
+async fn concurrent_capture_rpc_during_portal_geometry_switch_never_reverts_screen_sources() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        // Start ready on the 1920x1080 virtual privacy output.
+        let mut initial = ScreenCapture::unavailable("synthetic virtual desktop".into());
+        initial.backend = crate::desktop_backend::DesktopBackend::Portal;
+        initial.init_error = None;
+        initial.display = "wayland:portal".into();
+        initial.width = 1920;
+        initial.height = 1080;
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        let portal_session = Arc::new(crate::portal::PortalSession::test_dead());
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        {
+            initial.portal = Some(portal_session.clone());
+        }
+        let initial = Arc::new(initial);
+        let (_, locked) = tokio::sync::watch::channel(Some(false));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(initial.clone(), locked));
+        let (host, mut viewer) = connect(true, Some(portal.clone())).await;
+
+        let source_native_size = |message: &[u8]| -> Option<(u64, u64)> {
+            let sources = body(message, 7)?;
+            let display = body(sources, 1)?;
+            let rect = body(display, 6)?;
+            Some((varint_of(rect, 3)?, varint_of(rect, 4)?))
+        };
+        let sync_size = |message: &[u8]| -> Option<(u64, u64)> {
+            let sync = body(message, 25)?;
+            Some((varint_of(sync, 5)?, varint_of(sync, 6)?))
+        };
+
+        // Drain initial 1920x1080 CodecNegotiation + ScreenSources (starts on H.264), then enable
+        // H.265 so the RPC below deterministically triggers a codec-switch wait.
+        assert!(receive(&mut viewer.messages, 18, Duration::from_secs(5)).await.is_some());
+        let init_sources = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await
+            .expect("initial ScreenSources");
+        assert_eq!(source_native_size(&init_sources), Some((1920, 1080)));
+        host.video_track.test_set_h265(true);
+
+        // Send a CaptureSetting RPC that switches codec to H.265 (field 13 = 2) and output to
+        // 1280x720: the RPC handler snapshots 1920x1080 and blocks inside `wait_for_applied`.
+        let mut setting = Vec::new();
+        field_varint(13, 2, &mut setting);   // codec_type = H.265
+        field_varint(5, 1280, &mut setting); // width = 1280
+        field_varint(6, 720, &mut setting);  // height = 720
+        viewer.channels["CONTROL_DATA_CHANNEL"].send(&capture_rpc(88, 2, &setting).into()).await.unwrap();
+        assert!(receive(&mut viewer.messages, 22, Duration::from_millis(400)).await.is_none(),
+            "codec-switch RPC must wait for the first applied H.265 frame");
+
+        // While the RPC is parked in `wait_for_applied`, privacy exit switches to 3072x1920.
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        portal_session.test_set_size(3072, 1920);
+        portal.publish_test_screen(Arc::new(initial.with_portal_size(3072, 1920)));
+        assert!(receive(&mut viewer.messages, 18, Duration::from_secs(5)).await.is_some());
+        let switched_sources = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await
+            .expect("geometry watcher must push 3072x1920 ScreenSources while RPC waits");
+        assert_eq!(source_native_size(&switched_sources), Some((3072, 1920)));
+
+        // Now complete the codec switch: the RPC's ScreenSources must still advertise 3072x1920
+        // (never reverting to the pre-wait 1920x1080 snapshot).
+        host.video_track.test_note_applied(crate::capture_setting::VideoCodec::H265);
+        let reply = receive(&mut viewer.messages, 22, Duration::from_secs(5)).await
+            .expect("RPC reply after H.265 frame applied");
+        let header = body(&reply, 22).and_then(|r| body(r, 1)).expect("RpcResponse header");
+        assert_eq!(varint_of(header, 1), Some(88));
+        let rpc_sources = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await
+            .expect("RPC ScreenSources after output change");
+        assert_eq!(source_native_size(&rpc_sources), Some((3072, 1920)),
+            "in-flight RPC must not revert ScreenSources back to pre-wait 1920x1080");
+        let rpc_sync = receive(&mut viewer.messages, 25, Duration::from_secs(5)).await
+            .expect("RPC CaptureSettingSync");
+        assert_eq!(sync_size(&rpc_sync), Some((1280, 720)));
+
+        viewer.pc.close().await.unwrap();
+        host.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+
+        // Second phase: native-output (`resolution_type = 3`, `output = None`) codec-switch RPC
+        // waiting across a virtual->physical switch must also report the new live physical size
+        // (2560x1440) in CaptureSettingSync instead of the pre-wait snapshot (1920x1080).
+        let mut initial_2 = ScreenCapture::unavailable("synthetic virtual desktop".into());
+        initial_2.backend = crate::desktop_backend::DesktopBackend::Portal;
+        initial_2.init_error = None;
+        initial_2.display = "wayland:portal".into();
+        initial_2.width = 1920;
+        initial_2.height = 1080;
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        let portal_session_2 = Arc::new(crate::portal::PortalSession::test_dead());
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        {
+            initial_2.portal = Some(portal_session_2.clone());
+        }
+        let initial_2 = Arc::new(initial_2);
+        let (_, locked_2) = tokio::sync::watch::channel(Some(false));
+        let portal_2 = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(initial_2.clone(), locked_2));
+        let (host_2, mut viewer_2) = connect(true, Some(portal_2.clone())).await;
+        assert!(receive(&mut viewer_2.messages, 18, Duration::from_secs(5)).await.is_some());
+        assert_eq!(source_native_size(&receive(&mut viewer_2.messages, 7, Duration::from_secs(5)).await.unwrap()), Some((1920, 1080)));
+        host_2.video_track.test_set_h265(true);
+        let mut native_rpc = Vec::new();
+        field_varint(13, 2, &mut native_rpc); // codec_type = H.265
+        field_varint(10, 3, &mut native_rpc); // ChooseResolutionType = Native (output = None)
+        viewer_2.channels["CONTROL_DATA_CHANNEL"].send(&capture_rpc(89, 2, &native_rpc).into()).await.unwrap();
+        assert!(receive(&mut viewer_2.messages, 22, Duration::from_millis(400)).await.is_none());
+        #[cfg(all(target_os = "linux", feature = "portal"))]
+        portal_session_2.test_set_size(2560, 1440);
+        portal_2.publish_test_screen(Arc::new(initial_2.with_portal_size(2560, 1440)));
+        assert!(receive(&mut viewer_2.messages, 18, Duration::from_secs(5)).await.is_some());
+        assert_eq!(source_native_size(&receive(&mut viewer_2.messages, 7, Duration::from_secs(5)).await.unwrap()), Some((2560, 1440)));
+        host_2.video_track.test_note_applied(crate::capture_setting::VideoCodec::H265);
+        assert!(receive(&mut viewer_2.messages, 22, Duration::from_secs(5)).await.is_some());
+        let rpc_sync_2 = receive(&mut viewer_2.messages, 25, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(sync_size(&rpc_sync_2), Some((2560, 1440)),
+            "CaptureSettingSync must report current live native size after wait");
+
+        viewer_2.pc.close().await.unwrap();
+        host_2.pc.close().await.unwrap();
+        viewer_2.router.lock().await.stop().await.unwrap();
+    }).await.expect("concurrent capture RPC geometry regression exceeded deadline");
+}

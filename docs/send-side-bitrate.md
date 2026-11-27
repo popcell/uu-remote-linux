@@ -29,11 +29,15 @@ point the RTT is seconds and the picture is already dead.
 
 `src/video_governor.rs` keeps the encoder's bitrate cap at or below what RTCP says the path carries.
 It reads the receiver reports the feedback task already parses and, when the cap changes, writes
-`VideoSettings.net_kbps`. The in-process VAAPI engine retunes its rate control in place: context,
-surfaces and imported buffer stay, the change lands on the next IDR (`vaapi_set_rate`), and the
-stream loop reports the retune through `VideoTrack::note_rate_applied` so the governor's climb gate
-does not wait for a pipeline restart that never comes. Every other pipeline goes through the
-settings watch and its normal `reader.restart` path (RTP timeline preserved, first frame is an IDR).
+`VideoSettings.net_kbps` (bumping `VideoSettings.rate_revision`). The in-process VAAPI engine
+retunes its rate control in place (VBR/CBR drivers; CQP-only drivers fall back to a rate-controlled
+pipeline): context, surfaces and imported buffer stay, the change lands on the next IDR
+(`vaapi_set_rate`), and the stream loop stamps that applied revision onto `VideoTrack::rate_epoch()`
+once the AU finishes writing so the governor's climb gate waits for an AU that actually carries the
+change (not an earlier in-flight step or stale frame rate, and not a restart that never comes). Each
+reader owns its own `RateHandle` (written only by the stream loop on rate-only updates), so a
+restart gets a fresh handle and any multi-level fallback inside `read_encoder` inherits the latest
+rate and CQ snapshot with a matching `rate_revision`.
 
 - Signals: a `fraction_lost >= 8%` window that really lost packets, or a round trip that stayed over
   300 ms (or 250 ms above the session's lowest sample) for two seconds.
@@ -46,13 +50,17 @@ settings watch and its normal `reader.restart` path (RTP timeline preserved, fir
     `MIN_CONGESTION_LOST_PACKETS` (5) before its fraction counts; a path that breaks loses dozens.
   - The round trip is noisy in single samples (measured 563 ms and 1300 ms on an 18 ms link). It is
     confirmed by how long it stays over the knee, not by a report count, because the report cadence
-    belongs to the viewer. The sample itself is computed on a monotonic base so an NTP step does not
-    read as queueing.
+    belongs to the viewer. `NtpClock` watches each wall-clock sample against a monotonic
+    extrapolation and drops reports echoing pre-step sender timestamps for a short guard window
+    after any step beyond `WALL_STEP_MS` (50 ms).
   - NACK counts are deliberately **not** a trigger: they arrive in bursts (hundreds within 100 ms on a
     clean path), so an instantaneous rate reads as congestion on a perfect link.
 - Decrease: halve on loss, 15 % on a round trip alone (queueing is not loss), floor 800 kbit/s, at most
-  every 3 s. The rate that broke the path is remembered and recovery aims at 90 % of it, so a path
-  whose capacity is 3 Mbit/s does not retry 3.1 Mbit/s every twenty seconds.
+  every 3 s. The rate that broke the path is recorded only when a decrease actually takes effect (or
+  when sustained congestion persists at the floor past the 3 s gate), so draining reports right after
+  a cut do not overwrite the broken rate with the lowered cap and pin recovery for 60 s. Recovery aims
+  at 90 % of that broken rate, so a path whose capacity is 3 Mbit/s does not retry 3.1 Mbit/s every
+  twenty seconds.
 - Increase: +25% (at least 500 kbit/s) every 4 s, never above the aim. After 60 s without loss the aim
   is ignored once, which is the only way to discover that the path improved.
 - Ceiling: the viewer's own choice (`max_kbps`) stays the ceiling; when it is absent or unlimited, the

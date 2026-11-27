@@ -104,6 +104,14 @@ impl VideoTrack {
             }
         }).await.unwrap_or(false)
     }
+    #[cfg(test)]
+    pub(crate) fn test_set_h265(&self, supported: bool) {
+        self.has_h265.store(supported, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_note_applied(&self, codec: VideoCodec) {
+        self.progress.send_modify(|value| { value.0 += 1; value.1 = codec; });
+    }
     pub async fn write_sample_with_extensions(&self, codec: VideoCodec, sample: &Sample, extensions: &[webrtc::rtp::extension::HeaderExtension], generation: u64, rate_epoch: u64) -> Result<()> {
         if !self.supports(codec) { return Err(Error::ErrUnsupportedCodec); }
         let track = match codec { VideoCodec::H264 => &self.h264, VideoCodec::H265 => &self.h265 };
@@ -130,7 +138,9 @@ impl VideoTrack {
         }
         if complete {
             self.generation.store(generation, Ordering::Release);
-            self.rate_epoch.store(rate_epoch, Ordering::Release);
+            // Monotonic so synthetic frames (e.g. locked-desktop black video carrying 0) never
+            // regress the governor's confirmed rate revision.
+            self.rate_epoch.fetch_max(rate_epoch, Ordering::AcqRel);
             self.progress.send_modify(|value| { value.0 += 1; value.1 = codec; });
         }
         Ok(())

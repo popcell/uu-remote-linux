@@ -793,6 +793,7 @@ async fn read_encoder(
     #[cfg(feature = "inproc-av")]
     if let Err(error) = &result {
         if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
+            if let Some(rate) = rate.as_deref() { rate.deactivate_and_apply_to(&mut settings); }
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
             result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,try_vpp,sequence.clone(),settings,idr.clone(),budget.clone(),selection,rate.clone()).await;
         }
@@ -801,6 +802,7 @@ async fn read_encoder(
     // before dropping all the way to CPU libx264/libx265.
     if let Err(error) = &result {
         if try_vpp && !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none() {
+            if let Some(rate) = rate.as_deref() { rate.deactivate_and_apply_to(&mut settings); }
             VAAPI_VPP_FALLBACK.store(true, Ordering::Release);
             log::warn!("{} VPP filter unavailable; falling back to software NV12 upload: {}", encoder.name_for(settings.codec), error);
             result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection,rate.clone()).await;
@@ -809,6 +811,7 @@ async fn read_encoder(
     match result {
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
+            if let Some(rate) = rate.as_deref() { rate.deactivate_and_apply_to(&mut settings); }
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
             read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,false,sequence,settings,idr,budget,selection,rate).await
         },
@@ -911,22 +914,92 @@ fn buffer_ms_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Rate { pub target_bps: i64, pub max_bps: i64, pub buffer_bits: i64, pub cq: u32 }
 
-/// Carries a bitrate/quality step to the blocking encoder thread; `active` tells whether a pipeline
-/// that can apply it in place is running (only the in-process VAAPI engine can), and `applied` counts
-/// the retunes that engine has really taken.
-pub struct RateHandle { rate: Mutex<Rate>, active: AtomicBool, applied: std::sync::atomic::AtomicU64 }
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct LiveRate {
+    rate: Rate,
+    net_kbps: Option<u32>,
+    quality: u64,
+    custom_bps: u32,
+    revision: u64,
+    active: bool,
+}
+
+/// Carries the newest bitrate/quality settings to both a running in-process VAAPI engine and any
+/// multi-level fallback pipeline inside `read_encoder`. `active` lives under the same mutex as
+/// the snapshot so `try_set_if_active` and `deactivate_and_apply_to` linearize cleanly: an
+/// in-place write either lands before the fallback snapshots it, or observes `active == false`
+/// and triggers a fresh reader restart instead of being silently dropped.
+pub struct RateHandle { state: Mutex<LiveRate> }
 impl RateHandle {
-    pub fn new(rate: Rate) -> Self {
-        Self { rate: Mutex::new(rate), active: AtomicBool::new(false), applied: std::sync::atomic::AtomicU64::new(0) }
+    pub fn from_settings(settings: &VideoSettings, encoder: Encoder) -> Self {
+        Self {
+            state: Mutex::new(LiveRate {
+                rate: rate_for(settings, encoder),
+                net_kbps: settings.net_kbps,
+                quality: settings.quality,
+                custom_bps: settings.custom_bps,
+                revision: settings.rate_revision,
+                active: false,
+            }),
+        }
     }
-    pub fn set(&self, rate: Rate) { *self.rate.lock().unwrap_or_else(|e| e.into_inner()) = rate; }
-    pub fn get(&self) -> Rate { *self.rate.lock().unwrap_or_else(|e| e.into_inner()) }
-    pub fn active(&self) -> bool { self.active.load(Ordering::Acquire) }
-    pub fn activate(&self) { self.active.store(true, Ordering::Release); }
-    pub fn deactivate(&self) { self.active.store(false, Ordering::Release); }
-    /// Called by the encoder thread after it pushed a rate into the engine.
-    pub fn mark_applied(&self) { self.applied.fetch_add(1, Ordering::AcqRel); }
-    pub fn applied_epoch(&self) -> u64 { self.applied.load(Ordering::Acquire) }
+    #[cfg(test)]
+    pub fn new(rate: Rate) -> Self {
+        Self {
+            state: Mutex::new(LiveRate {
+                rate,
+                net_kbps: Some((rate.max_bps / 1000) as u32),
+                quality: crate::capture_setting::QUALITY_AUTO,
+                custom_bps: 0,
+                revision: 0,
+                active: false,
+            }),
+        }
+    }
+    /// Atomically publish a rate-only update iff an in-process VAAPI engine is currently active
+    /// on this handle. Returns `false` if the engine has already exited or deactivated, so the
+    /// stream loop restarts the reader instead of dropping the update.
+    pub fn try_set_if_active(&self, settings: &VideoSettings, encoder: Encoder) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.active { return false; }
+        *guard = LiveRate {
+            rate: rate_for(settings, encoder),
+            net_kbps: settings.net_kbps,
+            quality: settings.quality,
+            custom_bps: settings.custom_bps,
+            revision: settings.rate_revision,
+            active: true,
+        };
+        true
+    }
+    #[cfg(test)]
+    pub fn set(&self, rate: Rate) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.rate = rate;
+        guard.net_kbps = Some((rate.max_bps / 1000) as u32);
+        guard.revision = guard.revision.saturating_add(1);
+    }
+    pub fn get(&self) -> (Rate, u64) {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.rate, guard.revision)
+    }
+    /// Atomically close live-rate writes and copy the latest rate, quality preset and governor
+    /// revision into `settings` so every fallback stage (FFmpeg VPP, software NV12, CPU) starts
+    /// with one coherent configuration that cannot miss a concurrent `try_set_if_active`.
+    pub fn deactivate_and_apply_to(&self, settings: &mut VideoSettings) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active = false;
+        settings.net_kbps = guard.net_kbps;
+        settings.quality = guard.quality;
+        settings.custom_bps = guard.custom_bps;
+        settings.rate_revision = guard.revision;
+    }
+    pub fn activate(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).active = true;
+    }
+    pub fn deactivate(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).active = false;
+    }
 }
 
 fn rate_for(settings: &VideoSettings, encoder: Encoder) -> Rate {
@@ -946,6 +1019,7 @@ fn rate_only_change(current: &VideoSettings, next: &VideoSettings) -> bool {
     probe.net_kbps = next.net_kbps;
     probe.quality = next.quality;
     probe.custom_bps = next.custom_bps;
+    probe.rate_revision = next.rate_revision;
     probe == *next
 }
 
@@ -1028,15 +1102,14 @@ async fn read_encoder_with(
     settings: VideoSettings, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection, rate: Option<Arc<RateHandle>>,
 )->Result<(),String>{
-    // A retune may have landed after this reader was created, and a fallback inside this reader would
-    // otherwise start at the rate that retune replaced: every pipeline starts from the newest one.
+    // A retune may have landed after this reader was created, and any fallback inside this reader
+    // would otherwise start at the snapshot its reader was spawned with: atomically close live
+    // writes and snapshot the latest rate here. Only an in-process VAAPI engine with hardware RC
+    // (VBR/CBR) re-activates the handle once initialized.
     let mut settings = settings;
-    if let Some(rate) = rate.as_ref().filter(|rate| rate.active()) {
-        settings.net_kbps = Some((rate.get().max_bps / 1000) as u32);
+    if let Some(rate) = rate.as_deref() {
+        rate.deactivate_and_apply_to(&mut settings);
     }
-    // Only an in-process VAAPI pipeline can retune its rate control in place; claim the handle here
-    // so a restart onto another path clears any stale claim.
-    if let Some(rate) = rate.as_ref() { rate.deactivate(); }
     let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
     // Every pipeline start gets its own generation, whatever encoder or path it runs.
     let generation = next_encode_generation();
@@ -1063,15 +1136,10 @@ async fn read_encoder_with(
             target_bps: live_rate.target_bps, max_bps: live_rate.max_bps, buffer_bits: live_rate.buffer_bits,
             codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
-            // A VAAPI rate step must not reopen the pipeline (a restart is a keyframe burst into
-            // the path the governor just stepped down for); the handle retunes it in place.
-            rate: if encoder == Encoder::Vaapi {
-                if let Some(rate) = rate.as_ref() {
-                    rate.set(live_rate);
-                    rate.activate();
-                }
-                rate
-            } else { None },
+            rate_revision: settings.rate_revision,
+            // Activated inside run_vaapi only after vaapi_create succeeds with a non-CQP RC mode.
+            // Readers never write back to `RateHandle`; `stream_desktop_at` is the sole writer.
+            rate: if encoder == Encoder::Vaapi { rate } else { None },
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.effective_fps(),config.cq,max_kbps,encoder.name_for(settings.codec),
@@ -1162,6 +1230,10 @@ async fn read_encoder_with(
             }
         })))
     } else if let Some(session)=portal {
+        // The FFmpeg process pipeline reads SHM frames; record the per-connection SHM preference
+        // so any recovery during this connection negotiates SHM directly, while a later desktop
+        // connection (`begin()`) can re-evaluate DMA-BUF if the user switches back to VAAPI.
+        session.use_shm_capture();
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
         let sparse_enabled = std::env::var("UU_PORTAL_SPARSE").as_deref() != Ok("0");
         let portal_idr = idr.clone();
@@ -1243,7 +1315,7 @@ async fn read_encoder_with(
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame { source_generation: settings.source_generation, source_id: settings.source_id,
-                codec: settings.codec, sequence, generation, rate_epoch: 0, completed_at: Instant::now(), data: frame, _permit: permit,
+                codec: settings.codec, sequence, generation, rate_epoch: settings.rate_revision, completed_at: Instant::now(), data: frame, _permit: permit,
             }));
             if latest.is_closed() { return Ok(()); }
         }
@@ -1457,9 +1529,10 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // Only a SIGUSR2 since the session snapshot. A probe that finishes during setup is not a reload
     // (sessions started before the probe keep the legacy encoder for their lifetime).
     let mut reload_pending = crate::video_select::reload_since_session(reload_at_session, *reload.borrow());
-    // A bitrate/quality step of the in-process VAAPI engine retunes the running pipeline; the
-    // handle is created once per connection so a restart keeps carrying the viewer's latest choice.
-    let rate = Arc::new(RateHandle::new(rate_for(&current, live_selection.encoder)));
+    // Each reader task gets its own `RateHandle`, written solely by this loop when a rate-only
+    // change retunes the running in-process VAAPI engine in place. Non-rate changes (such as FPS,
+    // codec or geometry) spawn a fresh reader with a fresh handle, so an old reader can never
+    // stamp a newer revision onto stale-fps AUs or overwrite the newer reader's rate state.
     let open = {
         let display = display.clone();
         let portal = portal.clone();
@@ -1467,12 +1540,14 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         let sequence = sequence.clone();
         let idr = idr.clone();
         let budget = budget.clone();
-        let rate = rate.clone();
         move |size: (u32, u32), selection: crate::video_select::Selection, settings: VideoSettings| {
-            read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection, Some(rate.clone()))
+            let rate = Arc::new(RateHandle::from_settings(&settings, selection.encoder));
+            let fut = read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection, Some(rate.clone()));
+            (rate, fut)
         }
     };
-    let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
+    let (mut rate, initial_reader) = open(size, live_selection, current);
+    let mut reader = EncoderTask(tokio::spawn(initial_reader));
     // The privacy screen swaps the portal stream to a virtual output that can have another size.
     let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
@@ -1518,7 +1593,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                     }
                     // In-process engines honor this on the first frame; the process pipeline starts on an IDR.
                     idr.store(true, std::sync::atomic::Ordering::Relaxed);
-                    reader.restart(open(size, live_selection, current)).await;
+                    let (next_rate, next_reader) = open(size, live_selection, current);
+                    rate = next_rate;
+                    reader.restart(next_reader).await;
             } else if plan.is_some() {
                     log::info!("Codec preference changed; takes effect the next time a desktop connection starts");
                     seen_codec_pref = fresh.codec_pref;
@@ -1529,10 +1606,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         let next = *settings.borrow_and_update();
         if encoder_changed(&current, &next) || send_interrupted {
             let discard = needs_hard_discard(&current, &next) || send_interrupted;
-            // The handle always carries the newest desired rate, so a pipeline (or a fallback inside
-            // one) that starts later does not inherit the snapshot its reader was created with.
-            rate.set(rate_for(&next, live_selection.encoder));
-            if !discard && rate.active() && rate_only_change(&current, &next) {
+            if !discard && rate_only_change(&current, &next) && rate.try_set_if_active(&next, live_selection.encoder) {
                 // Retune the running VAAPI engine: same context, same surfaces, only the next keyframe.
                 log::info!("Desktop encoder rate: {}k -> {}k cq={} -> {} (in place)",
                     current.max_kbps().unwrap_or(0), next.max_kbps().unwrap_or(0), current.cq(), next.cq());
@@ -1543,13 +1617,15 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
             timeline.fps = u64::from(next.effective_fps());
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
             if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
+            let (next_rate, next_reader) = open(size, live_selection, next);
+            rate = next_rate;
             if discard {
                 reader.0.abort();
                 let _ = (&mut reader.0).await;
                 while receiver.try_recv().is_ok() {}
-                reader.0 = tokio::spawn(open(size, live_selection, next));
+                reader.0 = tokio::spawn(next_reader);
             } else {
-                reader.restart(open(size, live_selection, next)).await;
+                reader.restart(next_reader).await;
             }
             send_interrupted=false;
         } else {
@@ -1562,7 +1638,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                     log::info!("Desktop geometry changed during the stream ({}x{} -> {}x{}); restarting capture", size.0, size.1, resized.0, resized.1);
                     size = resized;
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                    let (next_rate, next_reader) = open(size, live_selection, current);
+                    rate = next_rate;
+                    reader.0 = tokio::spawn(next_reader);
                     continue;
                 }
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
@@ -1570,7 +1648,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                     applied.send_modify(|value| value.codec = VideoCodec::H264);
                     current = *settings.borrow_and_update();
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                    let (next_rate, next_reader) = open(size, live_selection, current);
+                    rate = next_rate;
+                    reader.0 = tokio::spawn(next_reader);
                     continue;
                 }
                 if result.is_err() && !crate::wayland::outputs().is_empty() && !crate::wayland::input_ready() {
@@ -1598,7 +1678,9 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                     let _ = (&mut reader.0).await;
                     while receiver.try_recv().is_ok() {}
                     idr.store(true, std::sync::atomic::Ordering::Relaxed);
-                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                    let (next_rate, next_reader) = open(size, live_selection, current);
+                    rate = next_rate;
+                    reader.0 = tokio::spawn(next_reader);
                 }
             },
             changed = settings.changed(), if settings_open => {
@@ -1672,6 +1754,64 @@ mod tests {
         assert!(!super::rate_only_change(&base, &VideoSettings { output: Some((1280, 720)), ..base }));
         assert!(!super::rate_only_change(&base, &VideoSettings { chroma: crate::capture_setting::CHROMA_444, ..base }));
         assert!(!super::rate_only_change(&base, &VideoSettings { source_generation: base.source_generation + 1, ..base }));
+        assert!(super::rate_only_change(&base, &VideoSettings { net_kbps: Some(4_000), rate_revision: 3, ..base }));
+    }
+
+    #[test]
+    fn rate_handle_preserves_retuned_rate_and_cq_across_fallback_levels() {
+        use crate::capture_setting::{QUALITY_AUTO, QUALITY_HD};
+        let initial = VideoSettings { quality: QUALITY_AUTO, ..Default::default() };
+        let handle = super::RateHandle::from_settings(&initial, super::Encoder::Vaapi);
+        let retuned = VideoSettings { quality: QUALITY_HD, net_kbps: Some(4_000), rate_revision: 5, ..initial };
+        // Before activate(), in-place publish is rejected so the stream loop restarts instead.
+        assert!(!handle.try_set_if_active(&retuned, super::Encoder::Vaapi));
+        handle.activate();
+        assert!(handle.try_set_if_active(&retuned, super::Encoder::Vaapi));
+
+        // First fallback closes live writes atomically while taking the latest snapshot; second and
+        // third fallbacks still inherit the latest cap, quality preset (CQ) and governor revision.
+        let mut ffmpeg_vpp = initial;
+        handle.deactivate_and_apply_to(&mut ffmpeg_vpp);
+        // Any later in-place attempt after deactivation must return false so the stream restarts.
+        let newer = VideoSettings { net_kbps: Some(2_000), rate_revision: 6, ..retuned };
+        assert!(!handle.try_set_if_active(&newer, super::Encoder::Vaapi));
+        let mut ffmpeg_sw = initial;
+        handle.deactivate_and_apply_to(&mut ffmpeg_sw);
+        let mut cpu = initial;
+        handle.deactivate_and_apply_to(&mut cpu);
+
+        for stage in [ffmpeg_vpp, ffmpeg_sw, cpu] {
+            assert_eq!(stage.net_kbps, Some(4_000));
+            assert_eq!(stage.quality, QUALITY_HD);
+            assert_eq!(stage.cq(), retuned.cq());
+            assert_eq!(stage.rate_revision, 5);
+        }
+    }
+
+    #[test]
+    fn fps_change_does_not_advance_previous_readers_rate_handle() {
+        let base = VideoSettings { fps: 60, net_kbps: Some(800), rate_revision: 4, ..Default::default() };
+        let fps_step = VideoSettings { net_fps: Some(30), rate_revision: 5, ..base };
+        assert!(!super::rate_only_change(&base, &fps_step));
+
+        // The running reader owns `old_handle` at revision 4; a non-rate-only FPS change spawns a
+        // fresh handle instead of publishing revision 5 to `old_handle`, so trailing 60 fps AUs
+        // cannot confirm the 30 fps revision and a fallback never splices rev 5 onto 60 fps.
+        let old_handle = super::RateHandle::from_settings(&base, super::Encoder::Vaapi);
+        old_handle.activate();
+        let new_handle = super::RateHandle::from_settings(&fps_step, super::Encoder::Vaapi);
+        assert_eq!(old_handle.get().1, 4);
+        assert_eq!(new_handle.get().1, 5);
+
+        let mut old_fallback = base;
+        old_handle.deactivate_and_apply_to(&mut old_fallback);
+        assert_eq!(old_fallback.effective_fps(), 60);
+        assert_eq!(old_fallback.rate_revision, 4);
+
+        let mut new_fallback = fps_step;
+        new_handle.deactivate_and_apply_to(&mut new_fallback);
+        assert_eq!(new_fallback.effective_fps(), 30);
+        assert_eq!(new_fallback.rate_revision, 5);
     }
 
     #[test]

@@ -47,6 +47,7 @@ struct VaapiConfigFFI {
     cap_height: u32,
     fps: u32,
     gop: u32,
+    cq: u32,
     target_bps: i64,
     max_bps: i64,
     buffer_bits: i64,
@@ -80,6 +81,16 @@ extern "C" {
     fn vaapi_import_dma_buffer(engine: *mut VaapiEngineOpaque, dma_fd: libc::c_int, stride: u32) -> libc::c_int;
     fn vaapi_import_frame(engine: *mut VaapiEngineOpaque, frame: *const crate::portal::DmaFrame) -> libc::c_int;
     fn vaapi_upload_host_buffer(engine: *mut VaapiEngineOpaque, host_ptr: *const u8, pitch: u32) -> libc::c_int;
+    fn vaapi_supports_rate_control(engine: *const VaapiEngineOpaque) -> libc::c_int;
+    fn vaapi_supports_bounded_sync(engine: *const VaapiEngineOpaque) -> libc::c_int;
+    fn vaapi_convert_input(engine: *mut VaapiEngineOpaque, release_input: libc::c_int) -> libc::c_int;
+    fn vaapi_encode_nv12(
+        engine: *mut VaapiEngineOpaque,
+        force_idr: libc::c_int,
+        count_gop: libc::c_int,
+        out_data: *mut *const u8,
+        out_len: *mut u32,
+    ) -> libc::c_int;
     fn vaapi_encode_frame(
         engine: *mut VaapiEngineOpaque,
         force_idr: libc::c_int,
@@ -156,27 +167,49 @@ pub struct Config {
     pub chroma: u64,
     /// UU_VIDEO_ENCODER=vaapi: the VAAPI engine (H.264 / HEVC Main) instead of NVENC.
     pub vaapi: bool,
+    /// Governor revision this pipeline started with (carried onto EncodedUnit.rate_epoch).
+    pub rate_revision: u64,
     /// Live rate control: the connection's `RateHandle`, so a bitrate/quality step retunes this
     /// engine instead of restarting the pipeline.
     pub rate: Option<Arc<crate::video::RateHandle>>,
 }
 
-/// Pushes a changed rate into the running engine once per frame. Returns silently when the handle
-/// is absent or nothing changed.
-fn sync_rate(engine: &SafeVaapiEngine, rate: Option<&Arc<crate::video::RateHandle>>, applied: &mut Option<crate::video::Rate>) {
-    let Some(rate) = rate else { return };
-    let wanted = rate.get();
-    if *applied == Some(wanted) { return; }
-    unsafe { vaapi_set_rate(engine.0, wanted.target_bps, wanted.max_bps, wanted.buffer_bits, wanted.cq) };
-    log::info!("VAAPI rate control: target={}k max={}k buffer={}k min_qp={} (in place)",
-        wanted.target_bps / 1000, wanted.max_bps / 1000, wanted.buffer_bits / 1000, wanted.cq);
-    *applied = Some(wanted);
-    // Bumped here, in the encoder thread: a stalled or dead pipeline cannot claim a rate it never took.
-    rate.mark_applied();
+struct RateActiveGuard(Option<Arc<crate::video::RateHandle>>);
+impl RateActiveGuard {
+    fn activate(rate: Option<&Arc<crate::video::RateHandle>>, supported: bool) -> Self {
+        if supported {
+            if let Some(rate) = rate {
+                rate.activate();
+                return Self(Some(rate.clone()));
+            }
+        }
+        Self(None)
+    }
+}
+impl Drop for RateActiveGuard {
+    fn drop(&mut self) {
+        if let Some(rate) = &self.0 { rate.deactivate(); }
+    }
 }
 
-/// Rate-control retunes the running engine has applied (0 when the handle is absent).
-fn rate_epoch(rate: Option<&Arc<crate::video::RateHandle>>) -> u64 { rate.map_or(0, |rate| rate.applied_epoch()) }
+/// Pushes a changed rate into the running engine once per frame and tracks the governor revision
+/// this engine has applied. Returns silently when the handle is absent or nothing changed.
+fn sync_rate(
+    engine: &SafeVaapiEngine,
+    rate: Option<&Arc<crate::video::RateHandle>>,
+    applied: &mut Option<crate::video::Rate>,
+    applied_revision: &mut u64,
+) {
+    let Some(rate) = rate else { return };
+    let (wanted, revision) = rate.get();
+    if *applied != Some(wanted) {
+        unsafe { vaapi_set_rate(engine.0, wanted.target_bps, wanted.max_bps, wanted.buffer_bits, wanted.cq) };
+        log::info!("VAAPI rate control: target={}k max={}k buffer={}k min_qp={} (in place)",
+            wanted.target_bps / 1000, wanted.max_bps / 1000, wanted.buffer_bits / 1000, wanted.cq);
+        *applied = Some(wanted);
+    }
+    *applied_revision = (*applied_revision).max(revision);
+}
 
 pub fn disabled() -> bool {
     std::env::var("UU_VIDEO_PIPELINE").is_ok_and(|v| v == "process")
@@ -238,28 +271,33 @@ fn acquire(
 struct CaptureStats {
     window: Option<Instant>,
     frames: u64,
-    /// Frame arrival -> rate gate open (the wait the fixed grid wasted), permit backpressure, encode.
-    /// All three are added only for an AU that was produced, so the averages describe one population.
+    /// Frame arrival -> rate gate open, permit backpressure, VPP copy (PipeWire lease hold), encode.
+    /// All four are added only for an AU that was produced, so the averages describe one population.
     gate: Duration, gate_max: Duration,
+    vpp: Duration, vpp_max: Duration,
     encode: Duration, encode_max: Duration,
     permit: Duration, permit_max: Duration,
-    gate_last: Duration, permit_last: Duration,
+    gate_last: Duration, vpp_last: Duration, permit_last: Duration,
 }
 impl CaptureStats {
     /// A pass without a fresh compositor frame (a keepalive re-encode) has no arrival to measure.
     fn gate(&mut self, arrived: Option<Instant>) { self.gate_last = arrived.map_or(Duration::ZERO, |at| at.elapsed()); }
     fn permit(&mut self, asked: Instant) { self.permit_last = asked.elapsed(); }
+    fn vpp(&mut self, started: Instant) { self.vpp_last = started.elapsed(); }
+    fn vpp_skipped(&mut self) { self.vpp_last = Duration::ZERO; }
     fn encoded(&mut self, started: Instant) {
         let took = started.elapsed();
         self.gate += self.gate_last; self.gate_max = self.gate_max.max(self.gate_last);
+        self.vpp += self.vpp_last; self.vpp_max = self.vpp_max.max(self.vpp_last);
         self.permit += self.permit_last; self.permit_max = self.permit_max.max(self.permit_last);
         self.encode += took; self.encode_max = self.encode_max.max(took); self.frames += 1;
         let window = *self.window.get_or_insert_with(Instant::now);
         if window.elapsed() < Duration::from_secs(10) { return; }
         let frames = self.frames.max(1) as f64;
-        log::info!("Portal encode stats: window_s={} frames={} gate_ms_avg={:.2} gate_ms_max={} encode_ms_avg={:.2} encode_ms_max={} permit_ms_avg={:.2} permit_ms_max={}",
+        log::info!("Portal encode stats: window_s={} frames={} gate_ms_avg={:.2} gate_ms_max={} vpp_ms_avg={:.2} vpp_ms_max={} encode_ms_avg={:.2} encode_ms_max={} permit_ms_avg={:.2} permit_ms_max={}",
             window.elapsed().as_secs(), self.frames,
             self.gate.as_secs_f64() * 1000.0 / frames, self.gate_max.as_millis(),
+            self.vpp.as_secs_f64() * 1000.0 / frames, self.vpp_max.as_millis(),
             self.encode.as_secs_f64() * 1000.0 / frames, self.encode_max.as_millis(),
             self.permit.as_secs_f64() * 1000.0 / frames, self.permit_max.as_millis());
         *self = CaptureStats { window: Some(Instant::now()), ..Default::default() };
@@ -290,7 +328,7 @@ pub fn run(
 pub fn black_frame(codec: crate::capture_setting::VideoCodec) -> Result<bytes::Bytes, String> {
     let device = CString::new(crate::video::vaapi_device()).map_err(|_| "Invalid VAAPI device")?;
     let config = VaapiConfigFFI {
-        width: 1280, height: 720, cap_width: 1280, cap_height: 720, fps: 1, gop: 1,
+        width: 1280, height: 720, cap_width: 1280, cap_height: 720, fps: 1, gop: 1, cq: 26,
         target_bps: 1_000_000, max_bps: 2_000_000, buffer_bits: 500_000,
         is_hevc: libc::c_int::from(codec == crate::capture_setting::VideoCodec::H265),
         device: device.as_ptr(),
@@ -337,6 +375,7 @@ fn run_vaapi(
         cap_height,
         fps: config.fps,
         gop: config.gop,
+        cq: config.cq,
         target_bps: config.target_bps,
         max_bps: config.max_bps,
         buffer_bits: config.buffer_bits,
@@ -348,10 +387,25 @@ fn run_vaapi(
         return Err("Failed to create native VAAPI engine".into());
     }
     let engine = SafeVaapiEngine(raw_engine);
-    let mut applied = None;
-    sync_rate(&engine, config.rate.as_ref(), &mut applied);
+    let rc_supported = unsafe { vaapi_supports_rate_control(engine.0) != 0 };
+    if !rc_supported && config.rate.is_some() {
+        // Desktop streams carry a send-side bitrate governor; running in uncapped CQP would
+        // ignore bitrate caps while stamping `config.rate_revision` as if applied. Fall back so
+        // `read_encoder` selects a pipeline whose rate control honors caps (FFmpeg VBR / CPU).
+        return Err("VAAPI driver only supports CQP rate control; falling back for bitrate capping".into());
+    }
+    let live_rate = rc_supported.then(|| config.rate.as_ref()).flatten().cloned();
+    let _rate_guard = RateActiveGuard::activate(live_rate.as_ref(), rc_supported);
+    let mut applied = Some(crate::video::Rate {
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+        cq: config.cq,
+    });
+    let mut applied_revision = config.rate_revision;
+    sync_rate(&engine, live_rate.as_ref(), &mut applied, &mut applied_revision);
     if let Some(portal) = config.portal.as_ref() {
-        return run_portal_vaapi(&config, portal, &engine, units, stop, idr, budget, &mut applied);
+        return run_portal_vaapi(&config, portal, Some(engine), live_rate.as_ref(), units, stop, idr, budget, &mut applied, &mut applied_revision);
     }
 
     // Capture stays at the full input size; VPP scales (or pads) to the encoder size.
@@ -386,13 +440,14 @@ fn run_vaapi(
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    let mut nv12_ready = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        sync_rate(&engine, config.rate.as_ref(), &mut applied);
+        sync_rate(&engine, live_rate.as_ref(), &mut applied, &mut applied_revision);
         let deadline = if dirty {
             next_tick
         } else {
@@ -432,8 +487,8 @@ fn run_vaapi(
             0
         };
 
-        // Keepalive frames re-encode the last surface; only damage needs a new copy of the screen.
-        if dirty {
+        // Keepalive frames re-encode the already-converted NV12 surface and do not advance GOP.
+        if dirty || !nv12_ready {
             match (dri3.as_ref(), capture.as_mut()) {
                 (Some(c), _) => {
                     if unsafe { dri3_capture_blit(c.0) } != 0 {
@@ -449,13 +504,18 @@ fn run_vaapi(
                 }
                 (None, None) => unreachable!(),
             }
+            let conv = unsafe { vaapi_convert_input(engine.0, 0) };
+            if conv != 0 {
+                return Err(format!("vaapi_convert_input failed with error {conv}"));
+            }
+            nv12_ready = true;
         }
 
         let mut out_data: *const u8 = std::ptr::null();
         let mut out_len: u32 = 0;
-        let res = unsafe { vaapi_encode_frame(engine.0, force_idr, &mut out_data, &mut out_len) };
+        let res = unsafe { vaapi_encode_nv12(engine.0, force_idr, libc::c_int::from(dirty), &mut out_data, &mut out_len) };
         if res != 0 {
-            return Err(format!("vaapi_encode_frame failed with error {res}"));
+            return Err(format!("vaapi_encode_nv12 failed with error {res}"));
         }
 
         if out_len > 0 && !out_data.is_null() {
@@ -468,7 +528,7 @@ fn run_vaapi(
                     data,
                     permit: send_permit,
                     completed_at: Instant::now(),
-                    rate_epoch: rate_epoch(config.rate.as_ref()),
+                    rate_epoch: applied_revision,
                 })
                 .is_err()
             {
@@ -490,6 +550,17 @@ fn run_vaapi(
         keepalive = random_keepalive(&mut seed);
     }
 }
+fn vaapi_encode_nv12_packet(engine: &SafeVaapiEngine, idr: &AtomicBool, count_gop: bool) -> Result<Vec<u8>, String> {
+    let mut data = std::ptr::null();
+    let mut length = 0;
+    let force_idr = libc::c_int::from(idr.swap(false, Ordering::AcqRel));
+    let result = unsafe { vaapi_encode_nv12(engine.0, force_idr, libc::c_int::from(count_gop), &mut data, &mut length) };
+    if result != 0 { return Err(format!("VAAPI encode failed: {result}")); }
+    if data.is_null() || length == 0 { return Ok(Vec::new()); }
+    Ok(unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec())
+}
+
+#[cfg(test)]
 fn vaapi_packet(engine: &SafeVaapiEngine, idr: &AtomicBool) -> Result<Vec<u8>, String> {
     let mut data = std::ptr::null();
     let mut length = 0;
@@ -500,19 +571,30 @@ fn vaapi_packet(engine: &SafeVaapiEngine, idr: &AtomicBool) -> Result<Vec<u8>, S
     Ok(unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec())
 }
 
+fn next_portal_frame_deadline(slot: &mut Instant, started: Instant, interval: Duration) -> Instant {
+    let next = *slot + interval;
+    // After a missed period, start fresh. Otherwise retain the nominal slots so an occasional
+    // late wake can be recovered over several frames, at most 500 us per interval.
+    *slot = if started >= next { started + interval } else { next };
+    (*slot).max(started + interval.saturating_sub(Duration::from_micros(500)))
+}
+
 fn run_portal_vaapi(
-    config: &Config, portal: &crate::portal::PortalSession, engine: &SafeVaapiEngine,
+    config: &Config, portal: &crate::portal::PortalSession, mut engine: Option<SafeVaapiEngine>,
+    live_rate: Option<&Arc<crate::video::RateHandle>>,
     units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
-    applied_rate: &mut Option<crate::video::Rate>,
+    applied_rate: &mut Option<crate::video::Rate>, applied_revision: &mut u64,
 ) -> Result<(), String> {
     use crate::portal::DmaCapture;
+    enum DmaStep { Skip, Keepalive, Fresh, Fatal }
     let interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
     // Event driven: the compositor's next frame wakes this loop, and `interval` only limits how
     // often an encode may start. The fixed grid this replaced slept to the next grid slot after
     // being woken by a frame that had already arrived, adding 0-13.3 ms (6.7 ms average at 75 fps)
     // between capture and encode, and beat against the compositor's own refresh.
     let mut seen = 0u64;
-    let mut next_allowed = Instant::now();
+    let mut nominal_slot = Instant::now();
+    let mut next_allowed = nominal_slot;
     // Floor for a pass that produced nothing (an unchanged buffer, a pending DMA-BUF negotiation):
     // without it a stream that owes a keepalive would re-run forever at full speed.
     let mut next_probe = Instant::now();
@@ -526,26 +608,25 @@ fn run_portal_vaapi(
     let mut cpu_frame = Vec::new();
     let mut uploaded = false;
     let mut input_dma = false;
+    let mut nv12_ready = false;
     let mut blank_frame = false;
     let mut dma_disabled = std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0");
     if dma_disabled { log::info!("Portal VAAPI DMA-BUF disabled by setting; pipeline=host-upload"); }
     loop {
         if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
-        sync_rate(engine, config.rate.as_ref(), applied_rate);
+        let Some(ref active_engine) = engine else { return Err("VAAPI engine unavailable".into()); };
+        sync_rate(active_engine, live_rate, applied_rate, applied_revision);
         let now = Instant::now();
         // Encode when a frame is waiting and the rate gate is open, or when the stream owes a
         // keepalive. Otherwise sleep until one of those: the level-triggered wait wakes on the
         // compositor's next frame, including one that arrived while the previous frame was encoded.
-        let keepalive_due = last_send.elapsed() >= keepalive || idr.load(Ordering::Acquire);
+        let keepalive_at = if idr.load(Ordering::Acquire) { now } else { last_send + keepalive };
         // A waiting frame only has to respect the rate gate; an owed keepalive also respects the
         // probe floor, which is what stops an unchanged or negotiating source from spinning.
-        let work = now >= next_allowed && (available.is_some() || (keepalive_due && now >= next_probe));
-        if !work {
-            // Sleep until a new frame, the gate opening for a waiting one, or the next probe.
-            let deadline = if available.is_some() { next_allowed }
-                else if keepalive_due { next_probe }
-                else { last_send + keepalive };
-            let wait = deadline.saturating_duration_since(now).max(Duration::from_millis(1));
+        let deadline = if available.is_some() { next_allowed }
+            else { next_allowed.max(next_probe).max(keepalive_at) };
+        if now < deadline {
+            let wait = deadline - now;
             match portal.wait_frame(&mut seen, wait) {
                 Ok(true) => { available = Some(Instant::now()); continue; }
                 Ok(false) => continue,
@@ -554,46 +635,83 @@ fn run_portal_vaapi(
                 Err(_) => std::thread::sleep(wait),
             }
         }
-        next_probe = now + interval;
+        next_probe = Instant::now() + interval;
         stats.gate(available.take());
         if portal.size() != config.input { return Err("Portal size changed; restart encoder".into()); }
         let permit_started = Instant::now();
         let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
         stats.permit(permit_started);
         if stop.load(Ordering::Relaxed) { return Ok(()); }
-        let encode_started = Instant::now();
+        let frame_started = Instant::now();
         let due = last_send.elapsed() >= keepalive || idr.load(Ordering::Acquire);
-        // An encoder fault is not a DMA-BUF layout problem: it is reported after the lease is
-        // released and tears this pipeline down instead of degrading capture to host upload. (A
-        // timeout means the GPU may still own the frame; the lease is dropped by the closure, which
-        // is the same window every other driver error here has - the gain is that the buffers are
-        // never handed to another encode.)
-        let mut fatal: Option<String> = None;
+        // Only the VPP copy (RGB DMA-BUF -> private NV12 surface) runs under the PipeWire lease:
+        // once VPP completes and clears the external surface wrapper, the lease is released before
+        // HEVC/H.264 encoding begins. That both cuts PipeWire loop lock hold time ~3x and isolates
+        // encoder vaSyncBuffer timeouts from compositor buffer recycling. If VPP times out, C waits
+        // for GPU completion/reset before returning -12; if still unsignaled (-13), `abandon` tells
+        // the lease not to queue the poisoned buffer back to the compositor.
+        let mut fatal: Option<(String, Option<u64>)> = None;
+        let mut leased_handle: Option<u64> = None;
         let captured = if dma_disabled { Ok(DmaCapture::Cpu) } else {
-            portal.with_dmabuf(&mut dma_version, |frame, changed| {
-                if !changed && input_dma && !due { return Ok(None); }
-                if changed || !input_dma {
-                    let result = unsafe { vaapi_import_frame(engine.0, frame) };
-                    if result != 0 { return Err(format!("VAAPI DMA-BUF import failed: {result}")); }
+            portal.with_dmabuf_controlled(Some(config.input), &mut dma_version, |frame, changed, handle_id, abandon| {
+                leased_handle = Some(handle_id);
+                if !changed && input_dma && nv12_ready {
+                    return Ok(if due { DmaStep::Keepalive } else { DmaStep::Skip });
                 }
-                // vaapi_encode_frame waits for VA completion before the PipeWire lease is released.
-                let packet = match vaapi_packet(engine, &idr) {
-                    Ok(packet) => packet,
-                    Err(error) => { fatal = Some(error); return Ok(None); }
-                };
+                let e = engine.as_ref().ok_or_else(|| "VAAPI engine dropped".to_string())?;
+                if unsafe { vaapi_supports_bounded_sync(e.0) } == 0 {
+                    nv12_ready = false;
+                    leased_handle = None;
+                    return Err("VAAPI driver lacks bounded surface sync for DMA-BUF".into());
+                }
+                let result = unsafe { vaapi_import_frame(e.0, frame) };
+                if result != 0 {
+                    nv12_ready = false;
+                    return Err(format!("VAAPI DMA-BUF import failed: {result}"));
+                }
+                let vpp_started = Instant::now();
+                let conv = unsafe { vaapi_convert_input(e.0, 1) };
+                if conv == -14 {
+                    nv12_ready = false;
+                    leased_handle = None;
+                    return Err("VAAPI driver lacks bounded surface sync for DMA-BUF".into());
+                }
+                if conv != 0 {
+                    nv12_ready = false;
+                    if conv == -13 {
+                        *abandon = true;
+                    }
+                    // Do NOT destroy `engine` here: driver surface destruction can itself wait on
+                    // the GPU. Return first so `Lease::drop` isolates/unlocks PipeWire, then tear
+                    // down `engine` outside the lease below.
+                    let scope = if matches!(conv, -12 | -13) { None } else { Some(handle_id) };
+                    fatal = Some((format!("VAAPI VPP convert failed: {conv}"), scope));
+                    return Ok(DmaStep::Fatal);
+                }
+                stats.vpp(vpp_started);
                 if !input_dma {
                     log::info!("Portal VAAPI capture pipeline=dma-buf zero_cpu_copy=true source={}x{} fourcc={} modifier={}",
                         frame.width, frame.height, frame.fourcc, frame.modifier);
                 }
                 input_dma = true;
+                nv12_ready = true;
                 blank_frame = false;
                 uploaded = true;
-                Ok(Some(packet))
+                Ok(DmaStep::Fresh)
             })
         };
-        if let Some(error) = fatal { return Err(error); }
+        if let Some((error, scope)) = fatal {
+            let _ = portal.disable_dmabuf_for(scope);
+            drop(engine.take());
+            return Err(error);
+        }
         let captured = match captured {
-            Ok(DmaCapture::Unavailable(code)) => {
+            Ok(DmaCapture::SizeChanged) => return Err("Portal size changed; restart encoder".into()),
+            Ok(DmaCapture::Unavailable(code, scope)) => {
+                if !portal.disable_dmabuf_for(scope) {
+                    dma_version = None;
+                    continue;
+                }
                 let reason = match code {
                     14 => "buffer layout unsupported or DMA-BUF disabled for this session",
                     16 => "compositor selected shared memory",
@@ -603,46 +721,75 @@ fn run_portal_vaapi(
                     _ => "DMA-BUF interface unavailable",
                 };
                 log::warn!("Portal DMA-BUF unavailable: {reason} (code={code}); falling back to native VAAPI host upload");
-                dma_disabled = true; portal.disable_dmabuf();
+                dma_disabled = true; nv12_ready = false;
                 DmaCapture::Cpu
             },
             Err(error) => {
+                if !portal.disable_dmabuf_for(leased_handle) {
+                    dma_version = None;
+                    continue;
+                }
                 log::warn!("Portal DMA-BUF unavailable: {error}; falling back to native VAAPI host upload");
-                dma_disabled = true; portal.disable_dmabuf();
+                dma_disabled = true; nv12_ready = false;
                 DmaCapture::Cpu
             },
             Ok(value) => value,
         };
-        let data = match captured {
-            DmaCapture::Frame(Some(packet)) => packet,
-            DmaCapture::Frame(None) | DmaCapture::Pending => continue,
-            state @ (DmaCapture::Cpu | DmaCapture::Blank) => {
+        let Some(ref active_engine) = engine else { return Err("VAAPI engine unavailable".into()); };
+        let (data, encode_started) = match captured {
+            DmaCapture::Frame(DmaStep::Fresh) => {
+                let enc_started = Instant::now();
+                (vaapi_encode_nv12_packet(active_engine, &idr, true)?, enc_started)
+            }
+            DmaCapture::Frame(DmaStep::Keepalive) => {
+                stats.vpp_skipped();
+                let enc_started = Instant::now();
+                (vaapi_encode_nv12_packet(active_engine, &idr, false)?, enc_started)
+            }
+            DmaCapture::Frame(DmaStep::Skip | DmaStep::Fatal) | DmaCapture::Pending => continue,
+            state @ (DmaCapture::Cpu | DmaCapture::Dead | DmaCapture::Blank) => {
                 cpu_frame.resize(config.input.0 as usize * config.input.1 as usize * 4, 0);
                 let changed = if matches!(state, DmaCapture::Blank) {
                     let changed = !blank_frame;
                     if changed { cpu_frame.fill(0); }
                     blank_frame = true;
+                    cpu_version = None;
+                    dma_version = None;
+                    changed
+                } else if matches!(state, DmaCapture::Dead) {
+                    blank_frame = false;
+                    let Some(changed) = portal.capture_dead_or_retry(&mut cpu_frame, &mut cpu_version)? else {
+                        dma_version = None;
+                        continue;
+                    };
                     changed
                 } else {
                     blank_frame = false;
                     portal.capture_changed(&mut cpu_frame, &mut cpu_version)?
                 };
-                if !changed && !input_dma && uploaded && !due { continue; }
-                if changed || input_dma || !uploaded {
-                    let result = unsafe { vaapi_upload_host_buffer(engine.0, cpu_frame.as_ptr(), config.input.0 * 4) };
+                let fresh = changed || input_dma || !uploaded || !nv12_ready;
+                if !fresh && !due { continue; }
+                if fresh {
+                    let vpp_started = Instant::now();
+                    let result = unsafe { vaapi_upload_host_buffer(active_engine.0, cpu_frame.as_ptr(), config.input.0 * 4) };
                     if result != 0 { return Err(format!("Portal VAAPI upload failed: {result}")); }
-                    input_dma = false; uploaded = true;
+                    let conv = unsafe { vaapi_convert_input(active_engine.0, 0) };
+                    if conv != 0 { return Err(format!("Portal VAAPI VPP convert failed: {conv}")); }
+                    stats.vpp(vpp_started);
+                    input_dma = false; uploaded = true; nv12_ready = true;
+                } else {
+                    stats.vpp_skipped();
                 }
-                vaapi_packet(engine, &idr)?
+                let enc_started = Instant::now();
+                (vaapi_encode_nv12_packet(active_engine, &idr, fresh)?, enc_started)
             },
-            DmaCapture::Unavailable(_) => unreachable!(),
+            DmaCapture::Unavailable(_, _) | DmaCapture::SizeChanged => unreachable!(),
         };
         if data.is_empty() { continue; }
         stats.encoded(encode_started);
-        // One interval between encode *starts*, so a frame's own encode time does not stretch the
-        // period (which would cap the rate below the negotiated one).
-        next_allowed = encode_started + interval;
-        if units.blocking_send(EncodedUnit { data, permit, completed_at: Instant::now(), rate_epoch: rate_epoch(config.rate.as_ref()) }).is_err() { return Ok(()); }
+        // VPP and encoding use time within the current frame period.
+        next_allowed = next_portal_frame_deadline(&mut nominal_slot, frame_started, interval);
+        if units.blocking_send(EncodedUnit { data, permit, completed_at: Instant::now(), rate_epoch: *applied_revision }).is_err() { return Ok(()); }
         last_send = Instant::now();
         keepalive = random_keepalive(&mut seed);
     }
@@ -851,7 +998,7 @@ fn run_nvenc(
                     data,
                     permit: send_permit,
                     completed_at: Instant::now(),
-                    rate_epoch: 0,
+                    rate_epoch: config.rate_revision,
                 })
                 .is_err()
             {
@@ -921,6 +1068,40 @@ fn pad_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, ds
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn portal_rate_gate_does_not_accumulate_timer_lateness() {
+        let start = Instant::now();
+        for fps in [5, 60, 120, 144] {
+            let interval = Duration::from_nanos(1_000_000_000 / fps);
+            let mut slot = start;
+            let mut next = start;
+            for frame in 1..=600 {
+                // A frame is ready at each deadline, but the timed wait returns 140 us late.
+                let woke = next + Duration::from_micros(140);
+                next = next_portal_frame_deadline(&mut slot, woke, interval);
+                assert_eq!(next, start + interval * frame);
+            }
+        }
+    }
+
+    #[test]
+    fn portal_rate_gate_bounds_catch_up_and_restarts_after_a_stall() {
+        let due = Instant::now();
+        let interval = Duration::from_nanos(1_000_000_000 / 120);
+        let woke = due + Duration::from_millis(3);
+        let mut slot = due;
+        let mut next = woke;
+        for _ in 0..6 {
+            let previous_start = next;
+            next = next_portal_frame_deadline(&mut slot, previous_start, interval);
+            assert!(next >= previous_start + interval - Duration::from_micros(500));
+        }
+        assert_eq!(next, due + interval * 6, "recover the original phase over several frames");
+        let resumed = next + Duration::from_secs(1);
+        assert_eq!(next_portal_frame_deadline(&mut slot, resumed, interval), resumed + interval);
+    }
+
     #[test]
     #[ignore = "requires a VAAPI render node and FFmpeg for independent decode verification"]
     fn vaapi_locked_frames_decode_as_black_in_both_codecs() {
@@ -948,7 +1129,7 @@ mod budget_tests {
         let (w, h) = (1280u32, 720u32);
         for (is_hevc, fmt) in [(0, "h264"), (1, "hevc")] {
             let cfg = VaapiConfigFFI {
-                width: w, height: h, cap_width: w, cap_height: h, fps: 60, gop: 20,
+                width: w, height: h, cap_width: w, cap_height: h, fps: 60, gop: 20, cq: 18,
                 target_bps: 4_000_000, max_bps: 6_000_000, buffer_bits: 1_000_000,
                 is_hevc, device: device.as_ptr(),
             };
@@ -1123,7 +1304,7 @@ mod portal_hardware_tests {
                 input: portal.size(), portal: Some(portal), display: "wayland:portal".into(),
                 output: None, fps: 60, gop: 120, cq: 18, target_bps: 16_000_000,
                 max_bps: 30_000_000, buffer_bits: 500_000, codec,
-                chroma: crate::capture_setting::CHROMA_420, vaapi: true, rate: None,
+                chroma: crate::capture_setting::CHROMA_420, vaapi: true, rate_revision: 0, rate: None,
             };
             let (tx, rx) = mpsc::channel(4);
             let stop = Arc::new(AtomicBool::new(false));
@@ -1178,6 +1359,7 @@ mod portal_hardware_tests {
     async fn reopen(portal: Arc<crate::portal::PortalSession>) {
         tokio::task::spawn_blocking(move || {
             portal.end();
+            portal.begin();
             assert!(portal.recover(&AtomicBool::new(false)).unwrap());
         }).await.unwrap();
     }
@@ -1323,7 +1505,7 @@ mod portal_hardware_tests {
             assert!(matches!(portal.with_dmabuf(&mut None, |_, _| Ok(())).unwrap(), crate::portal::DmaCapture::Cpu));
             locked.send(Some(false)).unwrap();
             let session = portal.clone();
-            tokio::task::spawn_blocking(move || { session.recover(&AtomicBool::new(false)).unwrap(); }).await.unwrap();
+            tokio::task::spawn_blocking(move || { session.begin(); session.recover(&AtomicBool::new(false)).unwrap(); }).await.unwrap();
             runner.idr.store(true, Ordering::Release);
             assert!(!decoded_is_black(&runner.hevc_idr().await, VideoCodec::H265), "desktop did not recover after unlock observation");
             println!("injected_lock_cycle={} source_closed=true placeholder_black=true same_arc_recovered=true", cycle + 1);
@@ -1351,16 +1533,19 @@ mod rate_tests {
         let high = Rate { target_bps: 6_000_000, max_bps: 8_000_000, buffer_bits: 1_000_000, cq: 18 };
         let device = CString::new(crate::video::vaapi_device()).unwrap();
         let ffi = VaapiConfigFFI {
-            width, height, cap_width: width, cap_height: height, fps: 60, gop: 250,
+            width, height, cap_width: width, cap_height: height, fps: 60, gop: 250, cq: low.cq,
             target_bps: low.target_bps, max_bps: low.max_bps, buffer_bits: low.buffer_bits,
             is_hevc: 1, device: device.as_ptr(),
         };
         let engine = SafeVaapiEngine(unsafe { vaapi_create(&ffi) });
         assert!(!engine.0.is_null(), "VAAPI engine unavailable on {}", crate::video::vaapi_device());
+        assert_eq!(unsafe { vaapi_supports_bounded_sync(engine.0) }, 1);
         let rate = Arc::new(RateHandle::new(low));
         let mut applied = None;
-        sync_rate(&engine, Some(&rate), &mut applied);
+        let mut applied_revision = 0;
+        sync_rate(&engine, Some(&rate), &mut applied, &mut applied_revision);
         assert_eq!(applied, Some(low), "the first frame carries the requested rate");
+        assert_eq!(unsafe { vaapi_supports_rate_control(engine.0) }, 1);
 
         let idr = AtomicBool::new(false);
         let mut pixels = vec![0u8; (width * height * 4) as usize];
@@ -1369,7 +1554,12 @@ mod rate_tests {
         let (mut low_bytes, mut low_frames, mut high_bytes, mut high_frames) = (0u64, 0u64, 0u64, 0u64);
         let mut irap_frames = 0;
         for frame in 0..=180 {
-            if frame == 120 { rate.set(high); sync_rate(&engine, Some(&rate), &mut applied); assert_eq!(applied, Some(high)); }
+            if frame == 120 {
+                rate.set(high);
+                sync_rate(&engine, Some(&rate), &mut applied, &mut applied_revision);
+                assert_eq!(applied, Some(high));
+                assert_eq!(applied_revision, 1);
+            }
             // Full-resolution noise keeps the encoder busy, so a bitrate step is measurable.
             for pixel in pixels.chunks_exact_mut(4) {
                 seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
@@ -1392,5 +1582,123 @@ mod rate_tests {
         let kbps = |bytes: u64, frames: u64| bytes as f64 * 8.0 * 60.0 / frames as f64 / 1000.0;
         let (low, high) = (kbps(low_bytes, low_frames), kbps(high_bytes, high_frames));
         assert!(high > low * 1.5, "the 8 Mbit/s window should carry more than 1.5x the 2 Mbit/s one: {low:.0} -> {high:.0} kbit/s");
+    }
+
+    /// Static keepalive frames (count_gop=0) reuse the prepared NV12 surface without firing
+    /// periodic GOP IDRs while still advancing H.264 frame_num / HEVC POC so the entire stream
+    /// decodes cleanly; explicit PLI (force_idr=1) and active changed frames (count_gop=1) still
+    /// emit IDRs on schedule, and HEVC forces an IDR at POC 4095 before 12-bit POC LSB wrap.
+    /// Also checks NULL out_len / out_data handling.
+    #[test]
+    #[ignore = "needs a VAAPI render node: cargo test --features inproc-av -- --ignored vaapi_keepalive_skips_periodic_idr"]
+    fn vaapi_keepalive_skips_periodic_idr_and_answers_pli() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let decode_and_count = |fmt: &str, stream: Vec<u8>, expected: usize| {
+            let mut decoder = Command::new("ffmpeg").args([
+                "-hide_banner", "-loglevel", "error", "-nostats", "-f", fmt, "-i", "pipe:0",
+                "-progress", "pipe:1", "-fps_mode", "passthrough", "-f", "null", "/dev/null",
+            ]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut stdin = decoder.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || stdin.write_all(&stream));
+            let out = decoder.wait_with_output().unwrap();
+            writer.join().unwrap().unwrap();
+            assert!(out.status.success() && out.stderr.is_empty(),
+                "{fmt} keepalive stream decode errors (expected={expected}): {}", String::from_utf8_lossy(&out.stderr));
+            let decoded: usize = String::from_utf8_lossy(&out.stdout).lines()
+                .filter_map(|line| line.strip_prefix("frame="))
+                .filter_map(|v| v.trim().parse().ok())
+                .last()
+                .unwrap_or(0);
+            assert_eq!(decoded, expected, "{fmt} decoded frame count mismatch");
+        };
+
+        let (width, height) = (1280u32, 720u32);
+        let device = CString::new(crate::video::vaapi_device()).unwrap();
+        let pixels = vec![0x42u8; (width * height * 4) as usize];
+        for (is_hevc, codec, fmt) in [
+            (0, crate::capture_setting::VideoCodec::H264, "h264"),
+            (1, crate::capture_setting::VideoCodec::H265, "hevc"),
+        ] {
+            let ffi = VaapiConfigFFI {
+                width, height, cap_width: width, cap_height: height, fps: 60, gop: 10, cq: 18,
+                target_bps: 4_000_000, max_bps: 6_000_000, buffer_bits: 1_000_000,
+                is_hevc, device: device.as_ptr(),
+            };
+            let engine = SafeVaapiEngine(unsafe { vaapi_create(&ffi) });
+            assert!(!engine.0.is_null(), "VAAPI engine unavailable on {} ({fmt})", crate::video::vaapi_device());
+            assert_eq!(unsafe { vaapi_upload_host_buffer(engine.0, pixels.as_ptr(), width * 4) }, 0);
+            assert_eq!(unsafe { vaapi_convert_input(engine.0, 0) }, 0);
+
+            let idr = AtomicBool::new(false);
+            let mut stream = Vec::new();
+            let mut total_frames = 0usize;
+            let first = vaapi_encode_nv12_packet(&engine, &idr, true).expect("frame 0");
+            assert!(crate::video::is_independent_frame_for(&first, codec), "{fmt} frame 0 must be IDR");
+            stream.extend_from_slice(&first);
+            total_frames += 1;
+
+            // 25 unchanged keepalive frames (> 2x GOP and > H.264 4-bit frame_num wrap) must emit
+            // zero periodic IDRs and still keep POC / frame_num strictly valid for decoders.
+            for i in 0..25 {
+                let p = vaapi_encode_nv12_packet(&engine, &idr, false).expect("keepalive");
+                assert!(!p.is_empty(), "{fmt} keepalive {i} empty");
+                assert!(!crate::video::is_independent_frame_for(&p, codec),
+                    "{fmt} keepalive frame {i} must not trigger periodic IDR");
+                stream.extend_from_slice(&p);
+                total_frames += 1;
+            }
+
+            // An explicit PLI/FIR still triggers an immediate IDR even on a keepalive frame.
+            idr.store(true, Ordering::Release);
+            let pli = vaapi_encode_nv12_packet(&engine, &idr, false).expect("pli");
+            assert!(crate::video::is_independent_frame_for(&pli, codec), "{fmt} PLI must produce IDR");
+            stream.extend_from_slice(&pli);
+            total_frames += 1;
+
+            // After `gop` active changed frames (count_gop=1), periodic IDR fires again.
+            let mut saw_periodic = false;
+            for _ in 0..10 {
+                let f = vaapi_encode_nv12_packet(&engine, &idr, true).expect("active");
+                stream.extend_from_slice(&f);
+                total_frames += 1;
+                if crate::video::is_independent_frame_for(&f, codec) {
+                    saw_periodic = true;
+                    break;
+                }
+            }
+            assert!(saw_periodic, "{fmt} active changed frames must still emit periodic IDR after GOP");
+
+            decode_and_count(fmt, stream, total_frames);
+
+            // NULL out_len / out_data must not crash.
+            assert_eq!(unsafe { vaapi_encode_nv12(engine.0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+        }
+
+        // HEVC 12-bit POC LSB wrap boundary (poc_since_idr == 4095) forces one IDR and resets POC cleanly.
+        let (sw, sh) = (128u32, 128u32);
+        let small_pixels = vec![0x33u8; (sw * sh * 4) as usize];
+        let ffi = VaapiConfigFFI {
+            width: sw, height: sh, cap_width: sw, cap_height: sh, fps: 60, gop: 10, cq: 24,
+            target_bps: 1_000_000, max_bps: 2_000_000, buffer_bits: 500_000,
+            is_hevc: 1, device: device.as_ptr(),
+        };
+        let engine = SafeVaapiEngine(unsafe { vaapi_create(&ffi) });
+        assert!(!engine.0.is_null(), "VAAPI engine unavailable for POC wrap test");
+        assert_eq!(unsafe { vaapi_upload_host_buffer(engine.0, small_pixels.as_ptr(), sw * 4) }, 0);
+        assert_eq!(unsafe { vaapi_convert_input(engine.0, 0) }, 0);
+        let idr = AtomicBool::new(false);
+        let mut wrap_stream = Vec::new();
+        let wrap_total = 4100usize;
+        let mut idr_indices = Vec::new();
+        for idx in 0..wrap_total {
+            let pkt = vaapi_encode_nv12_packet(&engine, &idr, false).expect("wrap keepalive");
+            if crate::video::is_independent_frame_for(&pkt, crate::capture_setting::VideoCodec::H265) {
+                idr_indices.push(idx);
+            }
+            wrap_stream.extend_from_slice(&pkt);
+        }
+        assert_eq!(idr_indices, vec![0, 4095], "HEVC keepalive must emit IDR at frame 0 and POC boundary 4095 only");
+        decode_and_count("hevc", wrap_stream, wrap_total);
     }
 }

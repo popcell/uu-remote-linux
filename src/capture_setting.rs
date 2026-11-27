@@ -58,10 +58,13 @@ pub struct VideoSettings {
     /// bitrate cap alone cannot carry the stream, fewer complete frames beat dropped ones.
     /// Never comes from the protocol; the viewer keeps showing its own nominal fps.
     pub net_fps: Option<u32>,
+    /// Monotonic revision bumped when the send-side governor changes effective rate or fps, so the
+    /// climb gate waits for an AU produced by that exact revision rather than an earlier in-flight one.
+    pub rate_revision: u64,
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None, rate_revision: 0 } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
@@ -242,9 +245,10 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
     settings.send_if_modified(|current| {
-        // The feedback loop owns net_kbps/net_fps; keep their newest values instead of replaying the snapshot.
+        // The feedback loop owns net_kbps/net_fps/rate_revision; keep their newest values instead of replaying the snapshot.
         next.net_kbps = current.net_kbps;
         next.net_fps = current.net_fps;
+        next.rate_revision = current.rate_revision;
         if *current == next { return false; }
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
@@ -351,7 +355,7 @@ mod tests {
         put_varint(18, 30, &mut body);
         let request = rpc(77, 2, &body);
         let response = handle_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None });
+        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None, rate_revision: 0 });
         assert_eq!(rx.borrow().max_kbps(), Some(2_000));
         let fields = decode_wire(&response).unwrap();
         assert_eq!(message(&fields, 1), Some(&[8u8, 77][..]));

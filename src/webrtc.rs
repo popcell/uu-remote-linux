@@ -143,6 +143,8 @@ pub struct WebRtcSession {
     pub controller: crate::input::Controller,
     pub context: Arc<Mutex<SessionContext>>,
     actions: Arc<crate::system_actions::PeerActions>,
+    #[cfg(test)]
+    video_track: Arc<crate::video_track::VideoTrack>,
 }
 
 /// Counts a desktop session once it is connected (a failed offer is not a session), while the
@@ -440,7 +442,7 @@ impl DesktopStream {
         let DesktopStream { track: video_track, portal_desktop, capture_size, capture_display, portal,
             settings_rx, settings, idr_request, selection, chroma_sync, reload_at_session, .. } = self;
         let (capture_size, capture_display, portal) = screen.map_or((capture_size, capture_display, portal),
-            |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
+            |screen| (screen.live_size(), screen.display.clone(), screen.portal.clone()));
         Some(tokio::spawn(async move { tokio::select! {
             _ = active.wait_for(|active| !*active) => log::info!("Live desktop stream stopped: a newer desktop took over"),
             _ = async move {
@@ -462,7 +464,7 @@ impl DesktopStream {
             } else { None };
             let (capture_size, capture_display, portal) = screen.as_ref().map_or(
                 (capture_size, capture_display, portal),
-                |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
+                |screen| (screen.live_size(), screen.display.clone(), screen.portal.clone()));
             let state_pc = streaming_pc.clone();
             if let Err(e) = crate::video::stream_desktop_at(streaming_pc, video_track, capture_size, capture_display, portal, settings_rx, settings, idr_request, selection, chroma_sync, reload_at_session).await {
                 // A send racing the viewer's close fails with a misleading track error.
@@ -692,9 +694,9 @@ impl WebRtcSession {
                         let log_now = reports == 1 || reports % 10 == 0;
                         for r in video_report_blocks(report, video_ssrc) {
                             let ntp=clock.now();
-                            let elapsed=ntp.map(|ntp| ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay));
+                            let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
                             let usable = r.last_sender_report!=0 && clock.accept(r.last_sender_report);
-                            let rtt=elapsed.filter(|e| usable&&*e<65536*30).map(|e|f64::from(e)*1000./65536.);
+                            let rtt=(usable && elapsed<65536*30).then(||f64::from(elapsed)*1000./65536.);
                             let (loss, lost_packets) = loss_window(r.fraction_lost, r.total_lost, &mut lost_total);
                             if log_now {
                                 log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} window_lost={:?} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,lost_packets,rtt);
@@ -703,13 +705,12 @@ impl WebRtcSession {
                             // or a swollen round trip is the only thing that lowers it.
                             let (ceiling,fps,nominal_fps)={let s=governor_settings.borrow();(s.ceiling_kbps(),s.effective_fps(),s.fps)};
                             let now_inst = std::time::Instant::now();
-                            // The climb resumes on the first AU of the *new* encoder configuration.
-                            // The frame counter alone is also advanced by frames the replaced
-                            // encoder had already queued, which unfroze the gate before the restart
-                            // had produced anything; a pipeline that never comes up must not hold it.
+                            // The climb resumes only once an AU carrying this exact governor revision
+                            // (or newer) has gone out — whether from an in-place retune, a pipeline
+                            // restart, or a multi-level fallback — so an earlier in-flight change
+                            // cannot unlock the gate prematurely.
                             if let Some(pending) = pending_apply.as_ref() {
-                                if governor_track.generation() > pending.generation
-                                    || governor_track.rate_epoch() > pending.rate_epoch {
+                                if governor_track.rate_epoch() >= pending.revision {
                                     governor.note_first_au(now_inst);
                                     pending_apply = None;
                                 } else if now_inst.duration_since(pending.at) >= AU_GATE_TIMEOUT {
@@ -729,11 +730,10 @@ impl WebRtcSession {
                                     Some(None)=>log::info!("Video frame rate released back to the viewer's setting"),
                                     None=>{},
                                 }
-                                let generation_before = governor_track.generation();
-                                let rate_epoch_before = governor_track.rate_epoch();
                                 let mut effective_changed = false;
-                                // Restarts the encoder at the new values through the settings watch;
-                                // one write so a bitrate+frame step reopens the pipeline exactly once.
+                                let mut target_revision = 0u64;
+                                // Restarts or retunes the encoder through the settings watch; one
+                                // write so a bitrate+frame step applies once.
                                 governor_settings.send_if_modified(|value| {
                                     let prev_kbps = value.max_kbps();
                                     let prev_fps = value.effective_fps();
@@ -742,11 +742,15 @@ impl WebRtcSession {
                                     if let Some(fps)=decision.fps { next.net_fps=fps; }
                                     if next == *value { return false; }
                                     effective_changed = next.max_kbps() != prev_kbps || next.effective_fps() != prev_fps;
+                                    if effective_changed {
+                                        next.rate_revision = value.rate_revision.saturating_add(1);
+                                        target_revision = next.rate_revision;
+                                    }
                                     *value = next;
                                     true
                                 });
                                 if effective_changed {
-                                    pending_apply = Some(PendingAu { generation: generation_before, rate_epoch: rate_epoch_before, at: now_inst });
+                                    pending_apply = Some(PendingAu { revision: target_revision, at: now_inst });
                                     governor.defer_climb_until_au();
                                 }
                             }
@@ -781,7 +785,7 @@ impl WebRtcSession {
 
         // Encode current X11 frames only while a peer is connected.
         let streaming_pc = pc.clone();
-        let capture_size = (capture.width, capture.height);
+        let capture_size = capture.live_size();
         let capture_display = capture.display.clone();
         // Per-connection mute / lock-after-session settings (安全 menu).
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
@@ -793,6 +797,8 @@ impl WebRtcSession {
         let chroma_sync_rx = Arc::new(std::sync::Mutex::new((!cfg!(test)).then_some(chroma_sync_rx)));
         // File/terminal/port-mapping connections carry no desktop video until capture_desktop.
         let control_video_track = video_track.clone();
+        #[cfg(test)]
+        let session_video_track = video_track.clone();
         let stream = DesktopStream {
             pc: Arc::downgrade(&streaming_pc), track: video_track, portal_desktop: portal_desktop.clone(),
             capture_size, capture_display, portal: capture.portal.clone(), settings_rx: video_settings_rx,
@@ -1014,6 +1020,7 @@ impl WebRtcSession {
                     }
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+                let control_geometry = Arc::new(std::sync::Mutex::new(None::<(u32, u32)>));
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
                     let settings = channel_video_settings.clone();
                     let track = peer_video_track.clone();
@@ -1025,6 +1032,7 @@ impl WebRtcSession {
                     let capture_role=channel_role.clone();
                     let settings_serial=peer_settings_serial.clone();
                     let capture_selection = peer_selection;
+                    let rpc_geometry = control_geometry.clone();
                     tokio::spawn(async move {
                         let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
                         loop {
@@ -1093,7 +1101,7 @@ impl WebRtcSession {
                             };
                             let Some(active_screen) = active_screen else { continue; };
                             let input_size = if active_screen.init_error.is_none() {
-                                active_screen.portal.as_ref().map_or((active_screen.width, active_screen.height), |p| p.size())
+                                active_screen.live_size()
                             } else { (1920, 1080) };
                             let input_size=crate::wayland::input_size(input_size);
                             let source_changed=source_before!=crate::wayland::selected();
@@ -1111,10 +1119,7 @@ impl WebRtcSession {
                                     if let Some(owner)=&switch_owner {owner.with_current(|| {
                                         if crate::wayland::selection()==target && crate::wayland::select(source_before).is_ok() {
                                             let (source_id,source_generation)=crate::wayland::selection();
-                                            // The feedback loop owns net_kbps/net_fps; a rollback of
-                                            // the switch must not replay its snapshot over them.
-                                            let (net_kbps,net_fps)=(settings.borrow().net_kbps,settings.borrow().net_fps);
-                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,net_fps,..settings_before});
+                                            rollback_screen_switch(&settings, settings_before, source_id, source_generation);
                                         }
                                     });}
                                     log::warn!("Screen switch failed; previous source requested");
@@ -1168,16 +1173,48 @@ impl WebRtcSession {
                             let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default().as_secs();
                             let next = || sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 22, &response));
                             let current = *settings.borrow();
-                            if current.output != output_before || resized.is_some() {
-                                match crate::capture_setting::screen_sources(next(), timestamp, input_size, current.output, "Linux desktop") {
+                            // Serialize with the Portal geometry watcher on the same mutex and
+                            // FIFO outbound queue, and re-read live geometry AFTER `wait_for_applied`
+                            // so a concurrent virtual->physical switch is never overwritten with
+                            // the pre-wait dimensions.
+                            let mut last_sent = rpc_geometry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let live_size = if desktop && active_screen.init_error.is_none() {
+                                if let Some(manager) = &manager {
+                                    let state = manager.snapshot();
+                                    if state.screen.init_error.is_none() {
+                                        crate::wayland::input_size(state.screen.live_size())
+                                    } else { input_size }
+                                } else {
+                                    resized.unwrap_or_else(|| crate::wayland::input_size(active_screen.live_size()))
+                                }
+                            } else { input_size };
+                            let geometry_changed = manager.is_some()
+                                && last_sent.is_some_and(|prev| prev != live_size);
+                            if geometry_changed {
+                                let codec_negotiation = crate::initialization::envelope(
+                                    next(),
+                                    timestamp,
+                                    18,
+                                    &crate::capture_setting::codec_negotiation(
+                                        live_size,
+                                        crate::video::display_fps(),
+                                        track.supports(crate::capture_setting::VideoCodec::H265),
+                                    ),
+                                );
+                                let _ = response_tx.send(codec_negotiation);
+                                *last_sent = Some(live_size);
+                            }
+                            let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 22, &response));
+                            if current.output != output_before || resized.is_some() || geometry_changed {
+                                match crate::capture_setting::screen_sources(next(), timestamp, live_size, current.output, "Linux desktop") {
                                     Ok(screens) => { let _ = response_tx.send(screens); }
                                     Err(error) => log::warn!("Screen sources update failed: {}", error),
                                 }
                             }
-                            let sync = crate::capture_setting::sync_payload(&current, input_size);
+                            let sync = crate::capture_setting::sync_payload(&current, live_size);
                             let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 25, &sync));
+                            drop(last_sent);
                         }
                     });
                 }
@@ -1216,6 +1253,8 @@ impl WebRtcSession {
                     let open_screen = screen.clone();
                     let open_selection = peer_selection;
                     let open_text_out = text_out.clone();
+                    let open_outbound = outbound.clone();
+                    let open_geometry = control_geometry.clone();
                     d.on_open(Box::new(move || {
                         if let Some(start_drain) = open_drain { tokio::spawn(start_drain()); }
                         let init_actions = open_actions.clone();
@@ -1233,6 +1272,8 @@ impl WebRtcSession {
                         let role = open_role.clone();
                         let pc = desktop_pc.upgrade();
                         let text_out = open_text_out.clone();
+                        let geometry_outbound = open_outbound.clone();
+                        let geometry_state = open_geometry.clone();
                         Box::pin(async move {
                           if let (Some(requests), Some(bridge), Some(desktop), Some(closed)) =
                               (deferred_requests, &mac_portal_bridge, &portal_desktop, control_closed)
@@ -1459,8 +1500,13 @@ impl WebRtcSession {
                             let (mut desktop, mut promoted, mut lock_reported) = (desktop, false, desktop);
                             let mut privacy_reported = false;
                             let mut screen = screen;
+                            let mut geometry_updates = None;
+                            let mut sent_portal_size = None;
                             loop {
                             loop {
+                                if desktop && portal_desktop.is_some() {
+                                    geometry_updates = portal_desktop.as_ref().map(|manager| manager.subscribe());
+                                }
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 // Tool peers are permitted without a desktop; the port-mapping viewer aborts on Reject.
@@ -1469,7 +1515,7 @@ impl WebRtcSession {
                                 } else { crate::system_metrics::Permission::Reject };
                                 // Without a desktop (headless/portal before consent) the port-mapping tool still waits
                                 // for ScreenSources/CaptureChange and aborts otherwise: tool peers get a nominal screen.
-                                let screen_size=crate::wayland::input_size(if screen.init_error.is_none() { (screen.width, screen.height) } else { (1920, 1080) });
+                                let screen_size=crate::wayland::input_size(if screen.init_error.is_none() { screen.live_size() } else { (1920, 1080) });
                                 let messages = [
                                     (8, crate::initialization::encode_capture_change(next_seq(), timestamp, 0, crate::wayland::selected() as i32, "Linux desktop")),
                                     (13, Ok(crate::initialization::envelope(next_seq(), timestamp, 13, &init_actions.metrics_payload(desktop_sound, desktop_permission)))),
@@ -1480,6 +1526,7 @@ impl WebRtcSession {
                                     (7, crate::capture_setting::screen_sources(next_seq(), timestamp, screen_size, init_video.borrow().output, "Linux desktop")),
                                 ];
                                 if desktop && screen.init_error.is_none() {
+                                    sent_portal_size = Some(screen_size);
                                     let codec = crate::capture_setting::preferred_codec_for(init_track.supports(crate::capture_setting::VideoCodec::H264),
                                         init_track.supports(crate::capture_setting::VideoCodec::H265), open_selection);
                                     init_video.send_if_modified(|current| if current.codec != codec {
@@ -1508,6 +1555,26 @@ impl WebRtcSession {
                                 (desktop, promoted) = (true, true);
                                 screen = role.screen_or(&screen);
                                 replay_clipboard_echo(channel.clone(), sequence.clone(), replay.clone(), role.clone());
+                            }
+                            if let (Some(updates), Some(sent_size)) = (geometry_updates.take(), sent_portal_size.take()) {
+                                *geometry_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent_size);
+                                let channel = channel.clone();
+                                let sequence = sequence.clone();
+                                let video_settings = init_video.clone();
+                                let hevc = init_track.supports(crate::capture_setting::VideoCodec::H265);
+                                let geometry_state = geometry_state.clone();
+                                let geometry_outbound = geometry_outbound.clone();
+                                tokio::spawn(async move {
+                                    watch_portal_geometry_updates(
+                                        updates,
+                                        geometry_state,
+                                        sequence,
+                                        video_settings,
+                                        hevc,
+                                        || channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open,
+                                        |message| geometry_outbound.send(message).is_ok(),
+                                    ).await;
+                                });
                             }
                             if !lock_reported {
                                 lock_reported = true;
@@ -2073,6 +2140,8 @@ impl WebRtcSession {
             controller,
             context,
             actions: session_actions,
+            #[cfg(test)]
+            video_track: session_video_track,
         })
     }
 
@@ -2369,6 +2438,91 @@ mod desktop_control_tests;
 #[path = "webrtc_lifecycle_tests.rs"]
 mod webrtc_lifecycle_tests;
 
+/// After initial CONTROL setup, re-publish CodecNegotiation (18) and ScreenSources (7) if the
+/// Portal desktop switches geometry (for example a KDE fast reconnect that initialized on the
+/// virtual privacy output right before `set_virtual(false)` restored the physical display).
+/// Serializes on `shared_geometry` and pushes onto the same FIFO outbound queue as capture-setting
+/// RPCs so an in-flight RPC can never write older dimensions after a geometry update.
+async fn watch_portal_geometry_updates(
+    mut updates: tokio::sync::watch::Receiver<crate::desktop_session::State>,
+    shared_geometry: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    video_settings: Arc<tokio::sync::watch::Sender<crate::capture_setting::VideoSettings>>,
+    hevc: bool,
+    mut open: impl FnMut() -> bool,
+    mut enqueue: impl FnMut(Vec<u8>) -> bool,
+) {
+    let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut check_now = true;
+    loop {
+        if !check_now {
+            tokio::select! {
+                changed = updates.changed() => if changed.is_err() { break; },
+                _ = health.tick() => {
+                    if !open() { break; }
+                }
+            }
+        }
+        check_now = false;
+        if !open() { break; }
+        let state = updates.borrow_and_update().clone();
+        if !state.waiting && state.screen.init_error.is_some() { break; }
+        if !state.ready() { continue; }
+        let mut last_sent = shared_geometry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let size = crate::wayland::input_size(state.screen.live_size());
+        if *last_sent == Some(size) { continue; }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let next_seq = || sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let codec_negotiation = crate::initialization::envelope(
+            next_seq(),
+            timestamp,
+            18,
+            &crate::capture_setting::codec_negotiation(size, crate::video::display_fps(), hevc),
+        );
+        let screen_sources = match crate::capture_setting::screen_sources(
+            next_seq(),
+            timestamp,
+            size,
+            video_settings.borrow().output,
+            "Linux desktop",
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                log::warn!("CONTROL Portal geometry update encode failed: {error}");
+                continue;
+            }
+        };
+        if !enqueue(codec_negotiation) || !enqueue(screen_sources) {
+            return;
+        }
+        *last_sent = Some(size);
+        drop(last_sent);
+        log::info!("CONTROL Portal geometry updated: {}x{}", size.0, size.1);
+    }
+}
+
+/// Roll back a failed screen switch while atomically keeping the network governor's current
+/// bitrate/fps targets and monotonic `rate_revision` (replaying an older revision would let
+/// the next governor step reuse a revision already confirmed by `VideoTrack::rate_epoch`).
+fn rollback_screen_switch(
+    settings: &tokio::sync::watch::Sender<crate::capture_setting::VideoSettings>,
+    before: crate::capture_setting::VideoSettings,
+    source_id: usize,
+    source_generation: u64,
+) {
+    settings.send_modify(|value| {
+        *value = crate::capture_setting::VideoSettings {
+            source_id,
+            source_generation,
+            net_kbps: value.net_kbps,
+            net_fps: value.net_fps,
+            rate_revision: value.rate_revision,
+            ..before
+        };
+    });
+}
+
 /// Virtual/overlay interfaces never carry the UU video path (ZeroTier, containers).
 fn ice_interface_allowed(name: &str) -> bool {
     !["zt", "docker", "br-", "veth", "virbr", "lo"].iter().any(|prefix| name.starts_with(prefix))
@@ -2441,23 +2595,24 @@ fn cause_name(cause: Option<crate::video_governor::Cause>) -> &'static str {
     }
 }
 
-/// A settings change, waiting for an AU that carries it: the first one from a restarted pipeline, or
-/// any after an in-place rate retune (which keeps the pipeline and its generation).
-struct PendingAu { generation: u64, rate_epoch: u64, at: std::time::Instant }
+/// A settings change waiting for an AU that carries at least `revision` (whether via in-place
+/// retune, pipeline restart, or multi-level fallback).
+struct PendingAu { revision: u64, at: std::time::Instant }
 /// A pipeline that never produces a frame must not hold the climb down forever.
 const AU_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// A wall-clock step (NTP, suspend/resume) is indistinguishable from queueing inside one report:
-/// one session measured 563 ms with `lost=0` on an 18 ms link. Beyond this much disagreement with
-/// the monotonic extrapolation the wall clock is treated as stepped.
-const WALL_STEP_MS: i64 = 200;
+/// one session measured 563 ms with `lost=0` on an 18 ms link. Normal `Instant` vs `SystemTime`
+/// drift across a 250 ms–3 s RR interval is < 2 ms, so disagreement beyond 50 ms marks a step
+/// and drops reports echoing pre-step sender timestamps.
+const WALL_STEP_MS: i64 = 50;
 /// How long after a clock step a report echoing a pre-step sender report may be rejected. Sender
 /// reports go out about once a second, so this is generous; without the bound the 16.16 half-range
 /// would turn the floor into a 9-hour rejection window.
 const STEP_GUARD: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// RTCP round-trip time from our sender report's NTP timestamp (`lsr`, which webrtc-rs stamps from
-/// the wall clock) and the receiver's `dlsr`, computed on a monotonic base so an NTP step does not
-/// read as seconds of queueing.
+/// the wall clock) and the receiver's `dlsr`. Compares each wall-clock read against a monotonic
+/// extrapolation so wall-clock steps arm `not_before` and reject reports echoing pre-step SRs.
 struct NtpClock {
     base_ms: i64,
     base: std::time::Instant,
@@ -2469,17 +2624,18 @@ struct NtpClock {
 
 impl NtpClock {
     fn new() -> Self { Self { base_ms: wall_ms(), base: std::time::Instant::now(), not_before: None } }
-    /// 16.16 fixed point NTP timestamp; only the low 32 bits survive the wrapping RTT math.
-    fn now(&mut self) -> Option<u32> {
+    /// 16.16 fixed point NTP timestamp matching the wall clock that webrtc-rs stamps into SRs;
+    /// re-anchors after checking whether wall time stepped relative to `Instant`.
+    fn now(&mut self) -> u32 {
         let now = std::time::Instant::now();
         let wall = wall_ms();
         let forecast = self.base_ms + now.duration_since(self.base).as_millis() as i64;
-        // Re-anchor only while the wall clock moves smoothly; a step keeps the extrapolation.
         let stepped = (wall - forecast).abs() > WALL_STEP_MS;
         self.base_ms = wall;
         self.base = now;
-        if stepped { self.not_before = Some((ntp_timestamp(wall), now + STEP_GUARD)); }
-        Some(ntp_timestamp(self.base_ms + now.duration_since(self.base).as_millis() as i64))
+        let current = ntp_timestamp(wall);
+        if stepped { self.not_before = Some((current, now + STEP_GUARD)); }
+        current
     }
     /// Whether a receiver report's echoed `lsr` can measure this clock: a report from before the last
     /// step cannot, and nothing is rejected once the guard window passed.
@@ -2559,8 +2715,8 @@ mod network_tests {
     #[test]
     fn a_wall_clock_step_does_not_read_as_round_trip_queueing() {
         let mut clock = NtpClock::new();
-        assert!(clock.now().is_some(), "a smooth clock reports");
-        assert!(clock.now().is_some(), "reports keep coming while the wall clock is steady");
+        let _ = clock.now();
+        let _ = clock.now();
         assert!(clock.accept(ntp_timestamp(wall_ms() - 1_000)), "a fresh sender report is usable");
         // A negative cumulative count clears the baseline instead of spanning two windows.
         let mut previous = Some(20);
@@ -2569,9 +2725,15 @@ mod network_tests {
         // Pretend the wall clock jumped an hour: the extrapolation and the wall clock disagree.
         let before_step = ntp_timestamp(wall_ms() - 5_000);
         clock.base_ms -= 3_600_000;
-        assert!(clock.now().is_some(), "the sample itself is computed from the new anchor");
+        let _ = clock.now();
         assert!(!clock.accept(before_step), "a sender report from before the step cannot measure it");
         assert!(clock.accept(ntp_timestamp(wall_ms())), "a post-step sender report can");
+        // A smaller 80 ms NTP step also arms the guard so pre-step SRs do not skew RTT.
+        let mut small_step = NtpClock::new();
+        let before_small = ntp_timestamp(wall_ms() - 500);
+        small_step.base_ms -= 80;
+        let _ = small_step.now();
+        assert!(!small_step.accept(before_small), "an 80 ms wall-clock step must guard pre-step SRs");
         // The 16.16 seconds field wraps every 18 hours: the comparison is a signed distance, so a
         // report after the wrap is not mistaken for one from before it.
         let mut wrapped = NtpClock::new();
@@ -2598,5 +2760,34 @@ mod network_tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!((blocks[0].ssrc, blocks[0].fraction_lost), (9, 51));
         assert!(video_report_blocks(&report, 0).next().is_none());
+    }
+
+    #[test]
+    fn screen_switch_rollback_preserves_governor_targets_and_rate_revision() {
+        use crate::capture_setting::VideoSettings;
+        let before = VideoSettings {
+            source_id: 0,
+            source_generation: 2,
+            output: Some((1920, 1080)),
+            net_kbps: Some(4_000),
+            net_fps: Some(60),
+            rate_revision: 4,
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::watch::channel(before);
+        // Screen switch temporarily moved source and cleared output; meanwhile the governor
+        // stepped bitrate/fps and bumped rate_revision to 5.
+        tx.send_modify(|s| {
+            s.source_id = 1;
+            s.source_generation = 3;
+            s.output = None;
+            s.net_kbps = Some(2_000);
+            s.net_fps = Some(30);
+            s.rate_revision = 5;
+        });
+        rollback_screen_switch(&tx, before, 0, 4);
+        let rolled = *rx.borrow();
+        assert_eq!((rolled.source_id, rolled.source_generation, rolled.output), (0, 4, Some((1920, 1080))));
+        assert_eq!((rolled.net_kbps, rolled.net_fps, rolled.rate_revision), (Some(2_000), Some(30), 5));
     }
 }
