@@ -69,6 +69,7 @@ impl VideoTrack {
     pub fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
     /// Rate-control retunes the engine that produced the last complete AU had applied.
     pub fn rate_epoch(&self) -> u64 { self.rate_epoch.load(Ordering::Acquire) }
+    pub(crate) async fn next_timestamp(&self) -> u32 { self.timeline.lock().await.timestamp }
     /// Records one transmitted access unit's packet span for retransmission attribution.
     fn note_span(&self, first: u16, count: usize, keyframe: bool) {
         let mut sent = self.framing.lock().unwrap_or_else(|e| e.into_inner());
@@ -113,6 +114,12 @@ impl VideoTrack {
         self.progress.send_modify(|value| { value.0 += 1; value.1 = codec; });
     }
     pub async fn write_sample_with_extensions(&self, codec: VideoCodec, sample: &Sample, extensions: &[webrtc::rtp::extension::HeaderExtension], generation: u64, rate_epoch: u64) -> Result<()> {
+        self.write_sample_with_timestamp(codec, sample, extensions, None, generation, rate_epoch).await
+    }
+    pub async fn write_sample_with_extensions_at(&self, codec: VideoCodec, sample: &Sample, extensions: &[webrtc::rtp::extension::HeaderExtension], timestamp: u32, generation: u64, rate_epoch: u64) -> Result<()> {
+        self.write_sample_with_timestamp(codec, sample, extensions, Some(timestamp), generation, rate_epoch).await
+    }
+    async fn write_sample_with_timestamp(&self, codec: VideoCodec, sample: &Sample, extensions: &[webrtc::rtp::extension::HeaderExtension], timestamp_override: Option<u32>, generation: u64, rate_epoch: u64) -> Result<()> {
         if !self.supports(codec) { return Err(Error::ErrUnsupportedCodec); }
         let track = match codec { VideoCodec::H264 => &self.h264, VideoCodec::H265 => &self.h265 };
         if track.all_binding_paused().await { return Ok(()); }
@@ -124,9 +131,9 @@ impl VideoTrack {
         };
         let count = payloads.len();
         let mut complete = count > 0;
-        let timestamp = state.timestamp;
+        let timestamp = timestamp_override.unwrap_or(state.timestamp);
         let first = state.sequence;
-        state.timestamp = state.timestamp.wrapping_add((sample.duration.as_secs_f64() * 90_000.0) as u32);
+        state.timestamp = timestamp.wrapping_add((sample.duration.as_secs_f64() * 90_000.0) as u32);
         // Publish the span before the writes: a retransmission request for an early packet of a large
         // access unit arrives while the rest is still being handed to the transport.
         if count > 0 { self.note_span(first, count, crate::video::is_independent_frame_for(&sample.data, codec)); }

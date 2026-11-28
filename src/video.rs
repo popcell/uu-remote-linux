@@ -720,20 +720,21 @@ fn ticks_to_duration(ticks: u64) -> Duration {
 
 /// RTP timestamps follow when frames actually leave the encoder, not a nominal
 /// 60fps count: a starved X11 capture would otherwise stamp 5fps as 60fps.
-/// webrtc-rs stamps a sample with the running timestamp and only then advances it
-/// by the sample duration, so each duration predicts the gap to the NEXT frame
-/// (one nominal frame after this one). A stall costs one frame of timing error
-/// and is corrected on the following frame instead of accumulating.
-struct RtpTimeline { origin: Option<Instant>, stamp: u64, fps: u64 }
-impl Default for RtpTimeline { fn default() -> Self { Self { origin: None, stamp: 0, fps: FPS } } }
+/// The timestamp is supplied to the packetizer for the frame that just completed. This keeps a
+/// long encode or capture stall on that frame instead of applying the gap to the following frame.
+struct RtpTimeline { origin: Option<Instant>, base: u32, elapsed: u64, fps: u64 }
+impl Default for RtpTimeline { fn default() -> Self { Self::new(FPS, 0) } }
 impl RtpTimeline {
-    fn duration_after(&mut self, completed_at: Instant) -> Duration {
+    fn new(fps: u64, base: u32) -> Self { Self { origin: None, base, elapsed: 0, fps: fps.max(1) } }
+    fn timestamp_at(&mut self, completed_at: Instant) -> u32 {
+        let first = self.origin.is_none();
         let origin = *self.origin.get_or_insert(completed_at);
         let real = ((completed_at.saturating_duration_since(origin).as_nanos() * u128::from(RTP_CLOCK) + 500_000_000) / 1_000_000_000) as u64;
-        let advance = (real + RTP_CLOCK / self.fps).saturating_sub(self.stamp).max(1);
-        self.stamp += advance;
-        ticks_to_duration(advance)
+        let elapsed = if first { 0 } else { real.max(self.elapsed.saturating_add(1)) };
+        self.elapsed = elapsed;
+        self.base.wrapping_add(elapsed as u32)
     }
+    fn nominal_duration(&self) -> Duration { ticks_to_duration((RTP_CLOCK / self.fps).max(1)) }
 }
 
 /// Frames travel through a short queue so P-frames are never silently replaced.
@@ -1551,7 +1552,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // The privacy screen swaps the portal stream to a virtual output that can have another size.
     let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
-    let mut timeline = RtpTimeline { fps: u64::from(current.effective_fps()), ..Default::default() };
+    let mut timeline = RtpTimeline::new(u64::from(current.effective_fps()), track.next_timestamp().await);
     let mut settings_open = true;
     let mut frames = 0u64;
     let mut skipped = 0u64;
@@ -1691,16 +1692,16 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 // A closed queue means the reader ended; its JoinHandle carries the reason.
                 let Some(frame) = frame else { return (&mut reader.0).await.map_err(|e| format!("Encoder reader task: {e}"))?; };
                 if !frame.matches(&current) { continue; }
-                let duration = timeline.duration_after(frame.completed_at);
+                let timestamp = timeline.timestamp_at(frame.completed_at);
                 if let Some(last) = previous { skipped += frame.sequence.saturating_sub(last + 1); }
                 max_age_ms = max_age_ms.max(frame.completed_at.elapsed().as_millis());
                 // Continue monitoring close even if the network send stalls.
                 let sample = Sample {
-                    data: frame.data.clone(), duration, ..Default::default()
+                    data: frame.data.clone(), duration: timeline.nominal_duration(), ..Default::default()
                 };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let sent_before=track.revision();
-                let send = track.write_sample_with_extensions(frame.codec, &sample, &extensions, frame.generation, frame.rate_epoch);
+                let send = track.write_sample_with_extensions_at(frame.codec, &sample, &extensions, timestamp, frame.generation, frame.rate_epoch);
                 let send_started=Instant::now();
                 tokio::pin!(send);
                 loop {
@@ -2203,23 +2204,16 @@ mod tests {
     }
     fn stamps(offsets_ms:&[u64])->Vec<u64>{
         let start=Instant::now();
-        let mut timeline=RtpTimeline::default();
-        let mut stamp=0;
-        offsets_ms.iter().map(|ms|{
-            let current=stamp;
-            stamp+=(timeline.duration_after(start+Duration::from_millis(*ms)).as_secs_f64()*90000.) as u64;
-            current
-        }).collect()
+        let mut timeline=RtpTimeline::new(FPS, 0);
+        offsets_ms.iter().map(|ms| u64::from(timeline.timestamp_at(start+Duration::from_millis(*ms)))).collect()
     }
     #[test]
     fn steady_60fps_keeps_exact_1500_tick_spacing_for_an_hour(){
         let start=Instant::now();
-        let mut timeline=RtpTimeline::default();
-        let mut stamp=0u64;
+        let mut timeline=RtpTimeline::new(FPS, 0);
         for frame in 0..216_000u64 {
             let at=start+Duration::from_nanos(frame*1_000_000_000/FPS);
-            assert_eq!(stamp,frame*1500);
-            stamp+=(timeline.duration_after(at).as_secs_f64()*90000.) as u64;
+            assert_eq!(timeline.timestamp_at(at), frame as u32 * 1500);
         }
     }
     #[test]
@@ -2227,14 +2221,16 @@ mod tests {
         // 5fps capture: frames 200ms apart must be ~18000 ticks apart, not 1500.
         let s=stamps(&[0,200,400,600,800]);
         assert_eq!(s[0],0);
-        for pair in s.windows(2).skip(1) { assert_eq!(pair[1]-pair[0],18_000); }
+        for pair in s.windows(2) { assert_eq!(pair[1]-pair[0],18_000); }
     }
     #[test]
-    fn stall_costs_one_frame_then_timeline_matches_real_time(){
+    fn stall_is_stamped_on_the_frame_that_completed_late(){
         let s=stamps(&[0,17,517,534,551]);
-        assert_eq!(s[2],17*90+1500);     // predicted before the stall was visible
-        assert_eq!(s[3],517*90+1500);    // realigned: one nominal frame after real stall end
-        assert_eq!(s[4],534*90+1500);    // no residual offset accumulates
+        assert_eq!(s[0],0);
+        assert_eq!(s[1],17*90);
+        assert_eq!(s[2],517*90);         // the 500ms gap belongs to the stalled frame
+        assert_eq!(s[3],534*90);
+        assert_eq!(s[4],551*90);
         assert!(s.windows(2).all(|p|p[1]>p[0]));
     }
     #[tokio::test]

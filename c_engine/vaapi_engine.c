@@ -50,6 +50,15 @@ static VaapiRuntime RT;
 static atomic_int rt_ready = 0;
 static pthread_mutex_t rt_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static uint32_t vaapi_requested_target_usage(void) {
+    const char *value = getenv("UU_VAAPI_TU");
+    char *end = NULL;
+    unsigned long parsed = value && *value ? strtoul(value, &end, 10) : 0;
+    if (value && *value && end && *end == '\0' && parsed >= 1 && parsed <= 7) return (uint32_t)parsed;
+    if (value && *value) fprintf(stderr, "[vaapi] ignoring UU_VAAPI_TU outside 1..7\n");
+    return 0;
+}
+
 static int vaapi_load_runtime(void) {
     if (atomic_load_explicit(&rt_ready, memory_order_acquire)) return 0;
     pthread_mutex_lock(&rt_lock);
@@ -133,6 +142,7 @@ struct VaapiEngine {
     uint32_t rc_mode;
     VAProfile enc_profile;
     int low_power;
+    uint32_t target_usage;
     int hevc_gpb;
     uint32_t hevc_tu_depth_inter;
     uint32_t hevc_tu_depth_intra;
@@ -195,6 +205,7 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
     engine->max_bps = config->max_bps > engine->target_bps ? config->max_bps : engine->target_bps;
     engine->buffer_bits = config->buffer_bits > 0 ? config->buffer_bits : engine->max_bps;
     engine->is_hevc = config->is_hevc;
+    const uint32_t requested_target_usage = vaapi_requested_target_usage();
     engine->min_qp = config->cq > 0 ? config->cq : 16;
     engine->dma_fd = -1;
     // calloc leaves surface/context IDs at 0, which is a valid VA ID; mark them unset.
@@ -313,14 +324,15 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
         VAEntrypoint ep = entrypoints[ep_i];
         for (int pr_i = 0; pr_i < n_profiles && engine->enc_cfg == VA_INVALID_ID; pr_i++) {
             VAProfile profile = profiles[pr_i];
-            VAConfigAttrib query[5];
+            VAConfigAttrib query[6];
             memset(query, 0, sizeof(query));
             query[0].type = VAConfigAttribRTFormat;
             query[1].type = VAConfigAttribRateControl;
             query[2].type = VAConfigAttribEncPackedHeaders;
             query[3].type = VAConfigAttribEncMaxRefFrames;
             query[4].type = VAConfigAttribEncHEVCBlockSizes;
-            int n_query = engine->is_hevc ? 5 : 4;
+            query[5].type = VAConfigAttribEncQualityRange;
+            int n_query = engine->is_hevc ? 6 : 4;
             st = RT.vaGetConfigAttributes(engine->va_dpy, profile, ep, query, n_query);
             if (st != VA_STATUS_SUCCESS) { last_st = st; continue; }
             if (query[0].value == VA_ATTRIB_NOT_SUPPORTED || !(query[0].value & VA_RT_FORMAT_YUV420)) continue;
@@ -342,6 +354,13 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
                     engine->rc_mode = rc;
                     engine->enc_profile = profile;
                     engine->low_power = (ep == VAEntrypointEncSliceLP);
+                    if (requested_target_usage && engine->is_hevc && engine->low_power
+                        && query[5].value != VA_ATTRIB_NOT_SUPPORTED && query[5].value > 1) {
+                        engine->target_usage = requested_target_usage > query[5].value ? query[5].value : requested_target_usage;
+                        fprintf(stderr, "[vaapi] HEVC target usage=%u (quality levels=%u)\n", engine->target_usage, query[5].value);
+                    } else if (requested_target_usage && engine->is_hevc && engine->low_power) {
+                        fprintf(stderr, "[vaapi] HEVC target usage unsupported by driver\n");
+                    }
                     if (engine->is_hevc) {
                         uint32_t l1 = (query[3].value == VA_ATTRIB_NOT_SUPPORTED) ? 0 : ((query[3].value >> 16) & 0xffff);
                         // Intel iHD EncSliceLP VDENC has no P-slice mode and encodes low-delay frames as GPB B-slices (L0=L1=prev).
@@ -586,7 +605,7 @@ static VABufferID vaapi_create_misc_buffer(VaapiEngine* engine, VAEncMiscParamet
 
 // Buffers for one encoded picture; every created ID is destroyed after the picture, success or not.
 typedef struct {
-    VABufferID seq, misc[3], pic, slice, packed[6];
+    VABufferID seq, misc[4], pic, slice, packed[6];
     int misc_n, packed_n;
 } EncBuffers;
 
@@ -1038,6 +1057,10 @@ int vaapi_encode_nv12(
         // numerator in the low 16 bits, denominator in the high 16 bits
         VAEncMiscParameterFrameRate fr = { .framerate = (1u << 16) | engine->fps };
         b.misc[b.misc_n++] = vaapi_create_misc_buffer(engine, VAEncMiscParameterTypeFrameRate, &fr, sizeof(fr));
+        if (engine->target_usage) {
+            VAEncMiscParameterBufferQualityLevel quality = { .quality_level = engine->target_usage };
+            b.misc[b.misc_n++] = vaapi_create_misc_buffer(engine, VAEncMiscParameterTypeQualityLevel, &quality, sizeof(quality));
+        }
         for (int i = 0; i < b.misc_n; i++) {
             if (b.misc[i] == VA_INVALID_ID) goto done;
         }
